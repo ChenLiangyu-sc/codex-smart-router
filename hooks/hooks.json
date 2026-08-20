@@ -1,0 +1,65 @@
+{
+  "description": "Session-scoped Smart Router control, guardrails, and receipt validation.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/router_hook.py\" session-start",
+            "timeout": 5,
+            "additionalContextLimit": 512
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/router_hook.py\" user-prompt-submit",
+            "timeout": 5,
+            "additionalContextLimit": 512
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|spawn_agent|mcp__smart_router__route_task|smart_router__route_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/router_hook.py\" pre-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__smart_router__route_task|smart_router__route_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/router_hook.py\" post-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "^router_",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/router_hook.py\" subagent-stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

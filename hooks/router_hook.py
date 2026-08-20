@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Unified Codex hook entry point. Fail-open on hook errors, fail-safe on routing."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
+
+from router_core import (  # noqa: E402
+    ROLES,
+    ROLE_LABELS,
+    WRITER_ROLES,
+    append_telemetry,
+    classify,
+    cleanup_expired,
+    data_root,
+    load_state,
+    parse_control,
+    prompt_digest,
+    routing_context,
+    save_state,
+    set_mode,
+    validate_receipt,
+    writer_lock_held,
+)
+
+WRAPPER_TOOL_NAMES = {
+    "mcp__smart_router__route_task",
+    "smart_router__route_task",
+}
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def hook_context(event: str, text: str) -> None:
+    emit({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
+
+
+def deny_pretool(reason: str) -> None:
+    emit(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+    )
+
+
+def read_input() -> dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    value = json.loads(raw)
+    return value if isinstance(value, dict) else {}
+
+
+def session_id(payload: dict[str, Any]) -> str:
+    value = payload.get("session_id") or payload.get("conversation_id")
+    return str(value) if value else "unknown-session"
+
+
+def status_text(state: dict[str, Any]) -> str:
+    last = state.get("last_decision")
+    if isinstance(last, dict):
+        last_text = ROLE_LABELS.get(str(last.get("role") or ""), "Sol")
+    else:
+        last_text = "暂无"
+    _, installed, wrapper_ready, parked = environment_details()
+    ready = installed == len(ROLES) and wrapper_ready and not parked
+    mode_labels = {"OFF": "已关闭", "SHADOW": "影子模式", "ON": "已开启"}
+    if ready:
+        environment = "就绪"
+    elif parked:
+        environment = "已停用（可用安装器 --enable 恢复）"
+    else:
+        environment = f"未就绪（agent {installed}/{len(ROLES)}，wrapper {'已安装' if wrapper_ready else '缺失'}）"
+    counts = state.get("execution_counts") or {}
+    completed = int(counts.get("completed", 0))
+    failed = int(counts.get("failed", 0))
+    last_execution = state.get("last_execution")
+    if isinstance(last_execution, dict):
+        outcome = "成功" if last_execution.get("outcome") == "completed" else "失败"
+        actual = f"最近实际执行：{ROLE_LABELS.get(str(last_execution.get('role')), '未知角色')}（{outcome}）"
+    else:
+        actual = "本会话尚无实际委派"
+    writer = "忙碌" if isinstance(state.get("active_writer"), dict) else "空闲"
+    return (
+        f"智能路由：{mode_labels[state['mode']]}（仅当前会话）｜环境：{environment}｜"
+        f"最近建议：{last_text}｜{actual}｜累计实际执行：成功 {completed}，失败 {failed}｜写入槽：{writer}。"
+    )
+
+
+def environment_details() -> tuple[Path, int, bool, bool]:
+    configured = os.environ.get("CODEX_HOME")
+    codex_home = Path(configured).expanduser() if configured else Path.home() / ".codex"
+    installed = sum((codex_home / "agents" / f"{role}.toml").is_file() for role in ROLES)
+    try:
+        config = (codex_home / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        config = ""
+    wrapper_ready = "[mcp_servers.smart_router]" in config
+    parked = (codex_home / "smart-router" / "DISABLED").exists()
+    return codex_home, installed, wrapper_ready, parked
+
+
+def on_session_start(payload: dict[str, Any]) -> None:
+    root = data_root()
+    cleanup_expired(root)
+    state = load_state(root, session_id(payload))
+    _, installed, wrapper_ready, parked = environment_details()
+    if parked:
+        command = PLUGIN_ROOT / "scripts" / "install_agents.py"
+        hook_context(
+            "SessionStart",
+            f'SMART_ROUTER_SETUP: 本地路由已停用。仅在合适时提醒用户运行 python3 "{command}" --enable；不要自动恢复。',
+        )
+    elif installed != len(ROLES) or not wrapper_ready:
+        command = PLUGIN_ROOT / "scripts" / "install_agents.py"
+        hook_context(
+            "SessionStart",
+            f'SMART_ROUTER_SETUP: 环境尚未就绪。仅在合适时提醒用户运行 python3 "{command}" --apply；不要自动安装。',
+        )
+    elif state["mode"] != "OFF":
+        hook_context("SessionStart", f"SR_SESSION mode={state['mode']} restored for this session.")
+
+
+def on_user_prompt(payload: dict[str, Any]) -> None:
+    sid = session_id(payload)
+    root = data_root()
+    prompt = str(payload.get("prompt") or "")
+    action = parse_control(prompt)
+    state = load_state(root, sid)
+    active = state.get("active_writer")
+    if isinstance(active, dict) and active.get("source") == "mcp":
+        workspace = active.get("cwd")
+        # PostToolUse is primary. If that event was lost, recover only after an
+        # OS-level workspace lock proves no writable child is still running.
+        # The wrapper uses the same lock, so a steered prompt cannot release a
+        # live writer merely because it starts another user turn.
+        if not workspace or not writer_lock_held(str(workspace)):
+            state["active_writer"] = None
+            save_state(root, sid, state)
+            append_telemetry(
+                root,
+                {
+                    "event": "writer_recovered_after_lock_check",
+                    "role": active.get("role"),
+                    "session": state["session_key"][:12],
+                },
+            )
+    if action in {"ON", "SHADOW", "OFF"}:
+        if action == "ON":
+            _, installed, wrapper_ready, parked = environment_details()
+            command = PLUGIN_ROOT / "scripts" / "install_agents.py"
+            if parked:
+                reply = f'智能路由尚未开启：本地路由已停用。请先运行 python3 "{command}" --enable。'
+                hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{reply}"')
+                return
+            if installed != len(ROLES) or not wrapper_ready:
+                reply = f'智能路由尚未开启：环境未就绪。请先运行 python3 "{command}" --apply。'
+                hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{reply}"')
+                return
+        state = set_mode(root, sid, action)
+        append_telemetry(root, {"event": "mode_changed", "mode": action, "session": state["session_key"][:12]})
+        replies = {
+            "ON": "已开启智能路由（仅当前会话）。边界清晰且适合委派的低风险任务会交给 Terra/Luna，高风险或不确定任务仍由 Sol 处理。",
+            "SHADOW": "已开启影子模式（仅当前会话）。后续只显示路由预览，不会实际委派。",
+            "OFF": "已关闭智能路由（仅当前会话）。后续任务全部由 Sol 处理。",
+        }
+        hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{replies[action]}"')
+        return
+    if action in {"STATUS", "HELP"}:
+        if action == "HELP":
+            reply = (
+                "当前会话可用命令：$router-control 开启、影子模式、关闭、状态。"
+                "开启后自动判断；影子模式只预览；全局关闭请使用 /plugins。"
+            )
+        else:
+            reply = status_text(state)
+        hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{reply}"')
+        return
+    if state["mode"] == "OFF":
+        return
+    decision = classify(prompt)
+    state["last_decision"] = decision
+    state["repair_attempts"] = 0
+    save_state(root, sid, state)
+    append_telemetry(
+        root,
+        {
+            "event": "route_decision",
+            "mode": state["mode"],
+            "decision": decision["decision"],
+            "role": decision.get("role"),
+            "risk": decision["risk"],
+            "reason_codes": decision["reason_codes"],
+            "prompt_sha256": prompt_digest(prompt),
+            "session": state["session_key"][:12],
+        },
+    )
+    hook_context("UserPromptSubmit", routing_context(state["mode"], decision))
+
+
+def _tool_input(payload: dict[str, Any]) -> dict[str, Any]:
+    value = payload.get("tool_input") or payload.get("input") or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _receipt_status(response: Any) -> str | None:
+    """Extract a child receipt status from common MCP result shapes."""
+    if not isinstance(response, dict):
+        return None
+    structured = response.get("structuredContent") or response.get("structured_content")
+    if isinstance(structured, dict) and structured.get("status") in {"completed", "blocked", "failed"}:
+        return str(structured["status"])
+    content = response.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            try:
+                parsed = json.loads(item["text"])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("status") in {"completed", "blocked", "failed"}:
+                return str(parsed["status"])
+    return None
+
+
+def on_pre_tool(payload: dict[str, Any]) -> None:
+    tool_input = _tool_input(payload)
+    tool_name = str(payload.get("tool_name") or payload.get("name") or "")
+    is_wrapper = tool_name in WRAPPER_TOOL_NAMES
+    role = str(tool_input.get("agent_type") or tool_input.get("name") or "")
+    if is_wrapper:
+        role = str(tool_input.get("role") or "")
+    if not role.startswith("router_"):
+        return
+    if role not in ROLES:
+        deny_pretool(f"Smart Router refused unknown agent role: {role}")
+        return
+    root = data_root()
+    sid = session_id(payload)
+    state = load_state(root, sid)
+    if state["mode"] != "ON":
+        deny_pretool(f"Smart Router mode is {state['mode']}; routing agents require ON.")
+        return
+    decision = state.get("last_decision") or {}
+    if decision.get("decision") != "DELEGATE" or decision.get("role") != role:
+        deny_pretool("Requested routing agent does not match the current safety decision.")
+        return
+    if role in WRITER_ROLES and not decision.get("write_authorized"):
+        deny_pretool("Writable routing agents require explicit positive write authorization in the current task.")
+        return
+    if not is_wrapper and tool_input.get("fork_turns") != "none":
+        deny_pretool("Routing agents require fork_turns=none to avoid leaking full conversation context.")
+        return
+    now = int(time.time())
+    active = state.get("active_writer")
+    if isinstance(active, dict) and not active.get("tool_use_id"):
+        # v0.1 created writer state without a call identity and could leave it
+        # behind after an MCP call. It is not safe to treat an unowned legacy
+        # record as a live lease after this version is installed.
+        state["active_writer"] = None
+        save_state(root, sid, state)
+        active = None
+    if role in WRITER_ROLES and isinstance(active, dict) and now - int(active.get("started_at", 0)) < 1800:
+        deny_pretool(f"Writable routing agent {active.get('role')} is already active.")
+        return
+    if role in WRITER_ROLES:
+        tool_use_id = str(payload.get("tool_use_id") or "")
+        if not tool_use_id:
+            deny_pretool("Writable routing agents require a tool_use_id for lifecycle-safe lease release.")
+            return
+        state["active_writer"] = {
+            "role": role,
+            "started_at": now,
+            "tool_use_id": tool_use_id,
+            "turn_id": str(payload.get("turn_id") or ""),
+            "cwd": str(payload.get("cwd") or os.getcwd()),
+            "source": "mcp" if is_wrapper else "native_agent",
+        }
+        save_state(root, sid, state)
+
+
+def on_post_tool(payload: dict[str, Any]) -> None:
+    """Record actual wrapper execution and release an exactly matched writer lease."""
+    tool_name = str(payload.get("tool_name") or payload.get("name") or "")
+    if tool_name not in WRAPPER_TOOL_NAMES:
+        return
+    tool_input = _tool_input(payload)
+    role = str(tool_input.get("role") or "")
+    if role not in ROLES:
+        return
+    tool_use_id = str(payload.get("tool_use_id") or "")
+    if not tool_use_id:
+        return
+    root = data_root()
+    sid = session_id(payload)
+    state = load_state(root, sid)
+    execution_key = f"{role}:{tool_use_id}"
+    recent = state.get("recent_execution_keys") or []
+    if execution_key in recent:
+        return
+    active = state.get("active_writer")
+    if role in WRITER_ROLES and not (
+        isinstance(active, dict)
+        and active.get("source") == "mcp"
+        and active.get("tool_use_id") == tool_use_id
+        and active.get("role") == role
+    ):
+        return
+    response = payload.get("tool_response")
+    receipt_status = _receipt_status(response)
+    failed = (
+        isinstance(response, dict)
+        and bool(response.get("isError") or response.get("is_error"))
+    ) or receipt_status in {"blocked", "failed"}
+    outcome = "failed" if failed else "completed"
+    counts = state["execution_counts"]
+    counts[outcome] = int(counts.get(outcome, 0)) + 1
+    state["last_execution"] = {
+        "role": role,
+        "outcome": outcome,
+        "tool_use_id": tool_use_id,
+        "at": int(time.time()),
+    }
+    state["recent_execution_keys"] = [*recent, execution_key][-128:]
+    released = False
+    if role in WRITER_ROLES:
+        state["active_writer"] = None
+        released = True
+    save_state(root, sid, state)
+    append_telemetry(
+        root,
+        {
+            "event": "route_execution_finished",
+            "role": role,
+            "outcome": outcome,
+            "receipt_status": receipt_status,
+            "writer_released": released,
+            "session": state["session_key"][:12],
+        },
+    )
+
+
+def on_subagent_stop(payload: dict[str, Any]) -> None:
+    role = str(payload.get("agent_type") or "")
+    if role not in ROLES:
+        return
+    root = data_root()
+    sid = session_id(payload)
+    state = load_state(root, sid)
+    raw = str(payload.get("last_assistant_message") or "")
+    valid, errors, receipt = validate_receipt(raw)
+    if valid:
+        state["repair_attempts"] = 0
+        active = state.get("active_writer")
+        if role in WRITER_ROLES and isinstance(active, dict) and active.get("source") == "native_agent":
+            state["active_writer"] = None
+        save_state(root, sid, state)
+        append_telemetry(
+            root,
+            {
+                "event": "receipt_valid",
+                "role": role,
+                "status": receipt.get("status") if receipt else None,
+                "session": state["session_key"][:12],
+            },
+        )
+        return
+    attempts = int(state.get("repair_attempts", 0))
+    if not payload.get("stop_hook_active") and attempts < 1:
+        state["repair_attempts"] = attempts + 1
+        save_state(root, sid, state)
+        emit(
+            {
+                "decision": "block",
+                "reason": "Return exactly one valid JSON receipt. Problems: " + "; ".join(errors),
+            }
+        )
+        return
+    active = state.get("active_writer")
+    if role in WRITER_ROLES and isinstance(active, dict) and active.get("source") == "native_agent":
+        state["active_writer"] = None
+    save_state(root, sid, state)
+    append_telemetry(
+        root,
+        {"event": "receipt_invalid_allowed", "role": role, "session": state["session_key"][:12]},
+    )
+
+
+HANDLERS = {
+    "session-start": on_session_start,
+    "user-prompt-submit": on_user_prompt,
+    "pre-tool-use": on_pre_tool,
+    "post-tool-use": on_post_tool,
+    "subagent-stop": on_subagent_stop,
+}
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in HANDLERS:
+        print("usage: router_hook.py " + "|".join(HANDLERS), file=sys.stderr)
+        return 2
+    try:
+        HANDLERS[sys.argv[1]](read_input())
+    except Exception as exc:  # hooks must not break normal Codex work
+        print(f"codex-smart-router hook warning: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

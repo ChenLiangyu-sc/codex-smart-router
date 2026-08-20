@@ -1,0 +1,6 @@
+interface:
+  display_name: "Smart Router 控制"
+  short_description: "开启、关闭或查看 Sol/Terra/Luna 智能路由状态"
+  default_prompt: "使用 $router-control 查看当前路由状态。"
+policy:
+  allow_implicit_invocation: false
