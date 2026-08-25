@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from install_agents import default_codex_home, inspect
+from provider_policy import glm_key, is_peak_window, key_fingerprint, load_policy, read_health
 
 
 def command(*args: str) -> tuple[int, str]:
@@ -39,6 +40,8 @@ def main() -> int:
         if f'{item["file"].removesuffix(".toml")} = {{' in config_text
     ]
     mcp_code, mcp_text = command("codex", "mcp", "get", "smart_router")
+    key = glm_key(home=home)
+    policy = load_policy(home)
     payload = {
         "codex_version": version_text,
         "version_supported": version_code == 0 and version_ok,
@@ -46,6 +49,14 @@ def main() -> int:
         "agents": inspect(home),
         "configured_roles": configured_roles,
         "wrapper_registered": mcp_code == 0 and "router_mcp.py" in mcp_text,
+        "glm": {
+            "credential_configured": bool(key),
+            "credential_fingerprint": key_fingerprint(key),
+            "peak_window_active": is_peak_window(policy=policy),
+            "policy": {name: value for name, value in policy.items() if name != "invalid"},
+            "policy_valid": not policy.get("invalid", False),
+            "health": read_health(home),
+        },
         "plugin_data": os.environ.get("PLUGIN_DATA", "managed by Codex when installed"),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))

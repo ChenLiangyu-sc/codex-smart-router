@@ -4,3 +4,6 @@ __pycache__/
 .coverage
 htmlcov/
 .DS_Store
+*.env
+*.key
+provider-health.json

@@ -1,5 +1,5 @@
 name = "router_worker"
-description = "Terra workspace writer for bounded, low-risk implementation and bug-fix tasks."
+description = "Provider-neutral workspace writer instructions; native fallback remains pinned to Terra."
 model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"

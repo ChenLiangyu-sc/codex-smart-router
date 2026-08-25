@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+import datetime as dt
 from pathlib import Path
 from unittest import mock
 from contextlib import redirect_stdout
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import run_agent
 import router_mcp
+import provider_policy
 
 
 def valid_receipt():
@@ -42,7 +44,18 @@ class WrapperTests(unittest.TestCase):
                     self.assertIn(f'model_reasoning_effort="{effort}"', command)
                     self.assertIn(f'sandbox_mode="{sandbox}"', command)
                     self.assertIn("--ephemeral", command)
-                    self.assertIn("hooks", command)
+                    for feature in (
+                        "hooks",
+                        "multi_agent",
+                        "plugins",
+                        "remote_plugin",
+                        "apps",
+                        "recommended_plugins",
+                        "skill_search",
+                        "skill_mcp_dependency_install",
+                        "workspace_dependencies",
+                    ):
+                        self.assertIn(feature, command)
 
     def test_high_risk_is_rejected_before_subprocess(self):
         with mock.patch("run_agent.subprocess.run") as run:
@@ -61,6 +74,8 @@ class WrapperTests(unittest.TestCase):
 
     def test_bounded_file_creation_is_allowed_for_worker(self):
         def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
             output = Path(command[command.index("--output-last-message") + 1])
             output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
@@ -94,13 +109,174 @@ class WrapperTests(unittest.TestCase):
         with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
             receipt = run_agent.run_task("router_scout", "搜索仓库中的测试文件")
         self.assertEqual(receipt["_router_meta"]["model"], "gpt-5.6-luna")
-        self.assertEqual(receipt["_router_meta"]["executor"], "codex-exec-wrapper")
+        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["provider"], "openai")
 
     def test_mcp_tool_schema_has_all_roles(self):
         tool = router_mcp.tool_definition()
         self.assertEqual(tool["name"], "route_task")
         roles = tool["inputSchema"]["properties"]["role"]["enum"]
         self.assertEqual(set(roles), set(run_agent.ROLE_SETTINGS))
+        profiles = tool["inputSchema"]["properties"]["execution_profile"]["enum"]
+        self.assertEqual(set(profiles), provider_policy.EXECUTION_PROFILES)
+
+    def test_glm_first_uses_glm_max_outside_peak(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            calls.append(command)
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            receipt = run_agent.run_task(
+                "router_reviewer",
+                "请独立做一次代码审查",
+                execution_profile="GLM_FIRST",
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                codex_home=tmp,
+            )
+        self.assertEqual(receipt["_router_meta"]["model"], "glm-5.3")
+        self.assertEqual(receipt["_router_meta"]["reasoning_effort"], "max")
+        self.assertIn('model_provider="zhipu_glm_coding"', calls[0])
+        self.assertNotIn("test-key", " ".join(calls[0]))
+
+    def test_child_shell_filter_excludes_glm_key(self):
+        command = run_agent.build_command(
+            "router_reviewer",
+            Path("receipt.json"),
+            provider_policy.EXECUTORS["glm_reviewer"],
+        )
+        self.assertIn('shell_environment_policy.exclude=["^ZHIPU_API_KEY$"]', command)
+        self.assertNotIn("any-real-secret", " ".join(command))
+
+    def test_partial_environment_override_preserves_runtime_path(self):
+        environment, key = run_agent._child_env(
+            provider_policy.EXECUTORS["glm_reviewer"],
+            {provider_policy.GLM_ENV_KEY: "test-key"},
+        )
+        self.assertEqual(key, "test-key")
+        self.assertEqual(environment[provider_policy.GLM_ENV_KEY], "test-key")
+        self.assertEqual(environment.get("PATH"), os.environ.get("PATH"))
+
+    def test_glm_quota_error_falls_back_to_terra_and_opens_circuit(self):
+        child_calls = []
+
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            child_calls.append(command)
+            if "glm-5.3" in command:
+                return subprocess.CompletedProcess(command, 1, "", '{"code":1317,"next_flush_time":1800000000}')
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            receipt = run_agent.run_task(
+                "router_reviewer",
+                "请独立做一次代码审查",
+                execution_profile="GLM_FIRST",
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                codex_home=tmp,
+            )
+            health = provider_policy.read_health(tmp)
+        self.assertEqual(receipt["_router_meta"]["model"], "gpt-5.6-terra")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "glm_runtime_failure")
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["glm_reviewer", "terra_reviewer"])
+        self.assertEqual(health["reason"], "quota_7d")
+
+    def test_glm_writer_failure_after_tool_activity_suppresses_fallback(self):
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            stdout = json.dumps({"type": "item.completed", "item": {"type": "command_execution"}})
+            return subprocess.CompletedProcess(command, 1, stdout, '{"code":1305}')
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            with self.assertRaisesRegex(run_agent.ChildFailure, "automatic writer fallback was suppressed"):
+                run_agent.run_task(
+                    "router_worker",
+                    "实现这个边界清晰的小功能",
+                    execution_profile="GLM_FIRST",
+                    workspace=tmp,
+                    now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    env={provider_policy.GLM_ENV_KEY: "test-key"},
+                    codex_home=tmp,
+                )
+
+    def test_writer_failure_without_complete_evidence_suppresses_fallback(self):
+        self.assertTrue(run_agent._writer_failure_may_have_mutated("router_worker", None, None, ""))
+        self.assertTrue(run_agent._writer_failure_may_have_mutated("router_worker", "clean", "clean", ""))
+        start_only = json.dumps({"type": "turn.started"})
+        self.assertTrue(
+            run_agent._writer_failure_may_have_mutated("router_worker", "clean", "clean", start_only)
+        )
+        safe_failure_stream = json.dumps({"type": "turn.failed", "error": {"message": "quota"}})
+        self.assertFalse(
+            run_agent._writer_failure_may_have_mutated(
+                "router_worker",
+                "clean",
+                "clean",
+                safe_failure_stream,
+            )
+        )
+
+    def test_glm_writer_failure_in_non_git_workspace_never_falls_back(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            if "rev-parse" in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            calls.append(command)
+            stdout = json.dumps({"type": "turn.failed", "error": {"message": "quota"}})
+            return subprocess.CompletedProcess(command, 1, stdout, '{"code":1317}')
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            with self.assertRaisesRegex(run_agent.ChildFailure, "automatic writer fallback was suppressed"):
+                run_agent.run_task(
+                    "router_worker",
+                    "实现这个边界清晰的小功能",
+                    execution_profile="GLM_FIRST",
+                    workspace=tmp,
+                    now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    env={provider_policy.GLM_ENV_KEY: "test-key"},
+                    codex_home=tmp,
+                )
+        self.assertEqual(len(calls), 1)
+
+    def test_glm_writer_quota_failure_falls_back_only_with_complete_no_write_evidence(self):
+        child_calls = []
+
+        def fake_run(command, **kwargs):
+            if "rev-parse" in command:
+                return subprocess.CompletedProcess(command, 0, str(Path(kwargs["cwd"]).resolve()) + "\n", "")
+            if command[:2] == ["git", "status"] or command[:2] == ["git", "diff"]:
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+            child_calls.append(command)
+            if "glm-5.3" in command:
+                stdout = json.dumps({"type": "turn.failed", "error": {"message": "quota"}})
+                return subprocess.CompletedProcess(command, 1, stdout, '{"code":1317}')
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            receipt = run_agent.run_task(
+                "router_worker",
+                "实现这个边界清晰的小功能",
+                execution_profile="GLM_FIRST",
+                workspace=tmp,
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                codex_home=tmp,
+            )
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["glm_worker", "terra_worker"])
 
     def test_mcp_version_comes_from_manifest(self):
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))

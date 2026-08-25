@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from provider_policy import EXECUTION_PROFILES, PROFILE_GLM_FIRST, PROFILE_STABLE
+
 PLUGIN_ID = "codex-smart-router"
 MODES = {"OFF", "SHADOW", "ON"}
 ROLES = {
@@ -88,6 +90,10 @@ SECURITY_AUTHORIZATION_ACTION = re.compile(
 )
 
 CONTROL_PATTERNS = (
+    (re.compile(r"\$router-control\s*(?:glm\s*(?:开启|启用|on)|(?:开启|启用)\s*glm)\b", re.I), "GLM_ON"),
+    (re.compile(r"/router\s+glm\s+on\b", re.I), "GLM_ON"),
+    (re.compile(r"\$router-control\s*(?:glm\s*(?:关闭|停用|off)|(?:关闭|停用)\s*glm)\b", re.I), "GLM_OFF"),
+    (re.compile(r"/router\s+glm\s+off\b", re.I), "GLM_OFF"),
     (re.compile(r"(?:\$router-control\s*)?(?:开启|启用)(?:智能)?路由", re.I), "ON"),
     (re.compile(r"\$router-control\s*(?:开启|启用|on)\b", re.I), "ON"),
     (re.compile(r"/router\s+on\b", re.I), "ON"),
@@ -237,9 +243,10 @@ def state_path(root: Path, session_id: str) -> Path:
 def default_state(session_id: str) -> dict[str, Any]:
     now = int(time.time())
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "session_key": session_key(session_id),
         "mode": "OFF",
+        "execution_profile": PROFILE_STABLE,
         "created_at": now,
         "updated_at": now,
         "last_decision": None,
@@ -279,7 +286,9 @@ def load_state(root: Path, session_id: str) -> dict[str, Any]:
         return default_state(session_id)
     # Additive migration keeps an existing session's mode while enabling newer
     # user-facing execution history.
-    state["schema_version"] = 3
+    state["schema_version"] = 4
+    profile = str(state.get("execution_profile") or PROFILE_STABLE).upper()
+    state["execution_profile"] = profile if profile in EXECUTION_PROFILES else PROFILE_STABLE
     counts = state.get("execution_counts")
     if not isinstance(counts, dict):
         counts = {}
@@ -323,6 +332,26 @@ def set_mode(root: Path, session_id: str, mode: str) -> dict[str, Any]:
     state["repair_attempts"] = 0
     # A mode change affects future routing only. Preserve any writer already in
     # flight so status and its eventual PostToolUse remain lifecycle-accurate.
+    save_state(root, session_id, state)
+    return state
+
+
+def set_execution_profile(
+    root: Path,
+    session_id: str,
+    profile: str,
+    *,
+    activate: bool = False,
+) -> dict[str, Any]:
+    normalized = profile.upper()
+    if normalized not in EXECUTION_PROFILES:
+        raise ValueError(f"unsupported execution profile: {profile}")
+    state = load_state(root, session_id)
+    state["execution_profile"] = normalized
+    if activate:
+        state["mode"] = "ON"
+    state["last_decision"] = None
+    state["repair_attempts"] = 0
     save_state(root, session_id, state)
     return state
 
@@ -597,22 +626,26 @@ def validate_receipt(raw: str) -> tuple[bool, list[str], dict[str, Any] | None]:
     return not errors, errors, receipt
 
 
-def routing_context(mode: str, decision: dict[str, Any]) -> str:
+def routing_context(mode: str, decision: dict[str, Any], execution_profile: str = PROFILE_STABLE) -> str:
     role = decision.get("role") or "main_sol"
     if mode == "SHADOW":
-        recommendation = ROLE_LABELS.get(role, "Sol") if decision["decision"] == "DELEGATE" else "Sol"
+        if decision["decision"] != "DELEGATE":
+            recommendation = "Sol"
+        elif execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
+            recommendation = "GLM-5.3 Max / Terra 动态执行"
+        else:
+            recommendation = ROLE_LABELS.get(role, "Sol")
         return (
             f"SR_SHADOW recommended={role} risk={decision['risk']}. Do not delegate; handle normally in Sol. "
             f'End the answer with exactly: "路由预览：{recommendation}".'
         )
     if decision["decision"] != "DELEGATE":
         return f"SR_ON INLINE_SOL risk={decision['risk']}. Do not delegate; handle normally in Sol without a route label."
-    label = ROLE_LABELS[role]
     write_flag = "1" if decision.get("write_authorized") else "0"
     return (
-        f"SR_ON DELEGATE role={role} write={write_flag}. Call smart_router.route_task once with this exact role "
-        "and a bounded self-contained task; no nested delegation. Integrate its receipt. "
-        f'Only if receipt status=completed, end with exactly: "路由：{label}". If status is blocked/failed, '
-        "the tool errors, or runtime is unavailable, continue in Sol and end with "
+        f"SR_ON DELEGATE role={role} profile={execution_profile} write={write_flag}. Call smart_router.route_task once "
+        "with these exact role/profile values, a bounded task, and only required image paths; no subagents. "
+        "Integrate the receipt. If completed, append `路由：` plus exact receipt._router_meta.route_label. "
+        "If blocked/failed/error, continue in Sol and end with "
         'exactly: "路由回退：Sol（委派未完成）".'
     )

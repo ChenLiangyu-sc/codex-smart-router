@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -74,6 +75,35 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(errors, 1)
         self.assertEqual(target.read_text(encoding="utf-8"), "user content\n")
         self.assertTrue(any("CONFLICT" in message for message in messages))
+
+    def test_owned_unchanged_old_version_is_upgraded_atomically(self):
+        target = self.home / "agents" / "router_worker.toml"
+        target.parent.mkdir(parents=True)
+        target.write_text('name = "router_worker"\ndescription = "old"\n', encoding="utf-8")
+        manifest = {
+            "manifest_version": 1,
+            "files": {
+                "router_worker.toml": {
+                    "sha256": install_agents.digest(target),
+                    "status": "active",
+                }
+            },
+        }
+        manifest_path = self.home / "smart-router" / "installed.json"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        replacement = Path(self.temp.name) / "router_worker.toml"
+        replacement.write_text(
+            'name = "router_worker"\ndescription = "new"\nmodel = "gpt-5.6-terra"\n',
+            encoding="utf-8",
+        )
+        with mock.patch("install_agents.source_files", return_value=[replacement]):
+            errors, messages = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0)
+        self.assertIn("description = \"new\"", target.read_text(encoding="utf-8"))
+        self.assertTrue(any(message.startswith("UPDATE") for message in messages))
+        updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["files"]["router_worker.toml"]["sha256"], install_agents.digest(replacement))
 
     def test_disable_and_enable_are_recoverable(self):
         install_agents.install(self.home, apply=True)

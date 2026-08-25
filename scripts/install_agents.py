@@ -331,13 +331,26 @@ def install(codex_home: Path, apply: bool) -> tuple[int, list[str]]:
     for source in source_files():
         target = agents / source.name
         source_hash = digest(source)
-        if target.exists() and digest(target) != source_hash:
-            messages.append(f"CONFLICT {target}: existing file differs; left untouched")
+        entry = manifest["files"].get(source.name, {})
+        current_hash = digest(target) if target.exists() else None
+        owned_old_version = bool(
+            target.exists()
+            and isinstance(entry, dict)
+            and entry.get("status") == "active"
+            and current_hash == entry.get("sha256")
+        )
+        if target.exists() and current_hash != source_hash and not owned_old_version:
+            messages.append(f"CONFLICT {target}: existing file differs from both current source and owned version; left untouched")
             errors += 1
             continue
-        action = "KEEP" if target.exists() else ("INSTALL" if apply else "WOULD_INSTALL")
+        if target.exists() and current_hash == source_hash:
+            action = "KEEP"
+        elif target.exists():
+            action = "UPDATE" if apply else "WOULD_UPDATE"
+        else:
+            action = "INSTALL" if apply else "WOULD_INSTALL"
         messages.append(f"{action} {target}")
-        if apply and not target.exists():
+        if apply and action in {"INSTALL", "UPDATE"}:
             atomic_copy(source, target)
         if apply:
             manifest["files"][source.name] = {"sha256": source_hash, "status": "active"}

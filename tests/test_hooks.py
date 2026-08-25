@@ -44,6 +44,15 @@ class HookTests(unittest.TestCase):
     def prompt(self, text):
         return self.call("user-prompt-submit", {"prompt": text})
 
+    def ready_home(self, name="ready-home"):
+        ready_home = self.data / name
+        agents = ready_home / "agents"
+        agents.mkdir(parents=True)
+        for role in router_core.ROLES:
+            (agents / f"{role}.toml").write_text("placeholder\n", encoding="utf-8")
+        (ready_home / "config.toml").write_text("[mcp_servers.smart_router]\n", encoding="utf-8")
+        return ready_home
+
     def test_off_and_ready_new_session_are_silent(self):
         ready_home = self.data / "ready-home"
         agents = ready_home / "agents"
@@ -115,6 +124,99 @@ class HookTests(unittest.TestCase):
         status = self.prompt("$router-control 状态")
         self.assertIn("智能路由：已开启", status["hookSpecificOutput"]["additionalContext"])
         self.assertIn("最近建议：Luna · 只读侦察", status["hookSpecificOutput"]["additionalContext"])
+
+    def test_glm_profile_activates_persists_and_is_bound_to_wrapper_calls(self):
+        ready_home = self.ready_home("glm-ready-home")
+        env = {"CODEX_HOME": str(ready_home)}
+        control = self.call(
+            "user-prompt-submit",
+            {"prompt": "$router-control glm 开启"},
+            env,
+        )
+        self.assertIn("GLM_FIRST", control["hookSpecificOutput"]["additionalContext"])
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["mode"], "ON")
+        self.assertEqual(state["execution_profile"], "GLM_FIRST")
+
+        routed = self.call(
+            "user-prompt-submit",
+            {"prompt": "请独立做一次代码审查"},
+            env,
+        )
+        context = routed["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("role=router_reviewer profile=GLM_FIRST", context)
+        native = self.call(
+            "pre-tool-use",
+            {"tool_input": {"agent_type": "router_reviewer", "fork_turns": "none"}},
+            env,
+        )
+        self.assertIn("smart_router.route_task", native["hookSpecificOutput"]["permissionDecisionReason"])
+        wrong_profile = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_input": {
+                    "role": "router_reviewer",
+                    "task": "请独立做一次代码审查",
+                    "execution_profile": "STABLE",
+                },
+            },
+            env,
+        )
+        self.assertIn("profile", wrong_profile["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(
+            self.call(
+                "pre-tool-use",
+                {
+                    "tool_name": "mcp__smart_router__route_task",
+                    "tool_input": {
+                        "role": "router_reviewer",
+                        "task": "请独立做一次代码审查",
+                        "execution_profile": "GLM_FIRST",
+                    },
+                },
+                env,
+            )
+        )
+        status = self.call("user-prompt-submit", {"prompt": "$router-control 状态"}, env)
+        status_text = status["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("执行配置：GLM_FIRST", status_text)
+        self.assertIn("最近建议：GLM-5.3 Max / Terra 动态执行", status_text)
+
+        disabled = self.call(
+            "user-prompt-submit",
+            {"prompt": "$router-control glm 关闭"},
+            env,
+        )
+        self.assertIn("恢复 STABLE", disabled["hookSpecificOutput"]["additionalContext"])
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["mode"], "ON")
+        self.assertEqual(state["execution_profile"], "STABLE")
+
+    def test_glm_profile_keeps_luna_for_light_roles_and_rejects_images(self):
+        ready_home = self.ready_home("glm-luna-home")
+        env = {"CODEX_HOME": str(ready_home)}
+        self.call("user-prompt-submit", {"prompt": "$router-control glm 开启"}, env)
+        routed = self.call(
+            "user-prompt-submit",
+            {"prompt": "搜索仓库并盘点文件"},
+            env,
+        )
+        self.assertIn("role=router_scout profile=GLM_FIRST", routed["hookSpecificOutput"]["additionalContext"])
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_input": {
+                    "role": "router_scout",
+                    "task": "搜索仓库并盘点文件",
+                    "execution_profile": "GLM_FIRST",
+                    "images": ["screen.png"],
+                },
+            },
+            env,
+        )
+        self.assertIn("Terra-capable", denied["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_shadow_never_delegates(self):
         self.prompt("$router-control 影子模式")

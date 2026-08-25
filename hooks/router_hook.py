@@ -13,6 +13,13 @@ from typing import Any
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
+from provider_policy import (  # noqa: E402
+    PROFILE_GLM_FIRST,
+    PROFILE_STABLE,
+    glm_key,
+    read_health,
+)
+
 from router_core import (  # noqa: E402
     ROLES,
     ROLE_LABELS,
@@ -26,6 +33,7 @@ from router_core import (  # noqa: E402
     prompt_digest,
     routing_context,
     save_state,
+    set_execution_profile,
     set_mode,
     validate_receipt,
     writer_lock_held,
@@ -72,13 +80,19 @@ def session_id(payload: dict[str, Any]) -> str:
 
 def status_text(state: dict[str, Any]) -> str:
     last = state.get("last_decision")
+    profile = str(state.get("execution_profile") or PROFILE_STABLE)
     if isinstance(last, dict):
-        last_text = ROLE_LABELS.get(str(last.get("role") or ""), "Sol")
+        last_role = str(last.get("role") or "")
+        if profile == PROFILE_GLM_FIRST and last_role in {"router_worker", "router_reviewer"}:
+            last_text = "GLM-5.3 Max / Terra 动态执行"
+        else:
+            last_text = ROLE_LABELS.get(last_role, "Sol")
     else:
         last_text = "暂无"
     _, installed, wrapper_ready, parked = environment_details()
     ready = installed == len(ROLES) and wrapper_ready and not parked
     mode_labels = {"OFF": "已关闭", "SHADOW": "影子模式", "ON": "已开启"}
+    profile_text = "GLM_FIRST" if profile == PROFILE_GLM_FIRST else "STABLE"
     if ready:
         environment = "就绪"
     elif parked:
@@ -91,12 +105,23 @@ def status_text(state: dict[str, Any]) -> str:
     last_execution = state.get("last_execution")
     if isinstance(last_execution, dict):
         outcome = "成功" if last_execution.get("outcome") == "completed" else "失败"
-        actual = f"最近实际执行：{ROLE_LABELS.get(str(last_execution.get('role')), '未知角色')}（{outcome}）"
+        label = str(last_execution.get("route_label") or ROLE_LABELS.get(str(last_execution.get("role")), "未知角色"))
+        actual = f"最近实际执行：{label}（{outcome}）"
     else:
         actual = "本会话尚无实际委派"
     writer = "忙碌" if isinstance(state.get("active_writer"), dict) else "空闲"
+    if profile == PROFILE_GLM_FIRST:
+        health = read_health()
+        if not glm_key():
+            glm_status = "GLM Key 未配置，将用 Terra"
+        elif health.get("state") == "closed":
+            glm_status = "GLM 可用（高峰时段自动改用 Terra）"
+        else:
+            glm_status = f"GLM 熔断：{health.get('reason') or 'unknown'}"
+    else:
+        glm_status = "GLM 未启用"
     return (
-        f"智能路由：{mode_labels[state['mode']]}（仅当前会话）｜环境：{environment}｜"
+        f"智能路由：{mode_labels[state['mode']]}（仅当前会话）｜执行配置：{profile_text}｜{glm_status}｜环境：{environment}｜"
         f"最近建议：{last_text}｜{actual}｜累计实际执行：成功 {completed}，失败 {failed}｜写入槽：{writer}。"
     )
 
@@ -159,8 +184,8 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
                     "session": state["session_key"][:12],
                 },
             )
-    if action in {"ON", "SHADOW", "OFF"}:
-        if action == "ON":
+    if action in {"ON", "SHADOW", "OFF", "GLM_ON", "GLM_OFF"}:
+        if action in {"ON", "GLM_ON"}:
             _, installed, wrapper_ready, parked = environment_details()
             command = PLUGIN_ROOT / "scripts" / "install_agents.py"
             if parked:
@@ -171,19 +196,34 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
                 reply = f'智能路由尚未开启：环境未就绪。请先运行 python3 "{command}" --apply。'
                 hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{reply}"')
                 return
-        state = set_mode(root, sid, action)
-        append_telemetry(root, {"event": "mode_changed", "mode": action, "session": state["session_key"][:12]})
+        if action == "GLM_ON":
+            state = set_execution_profile(root, sid, PROFILE_GLM_FIRST, activate=True)
+        elif action == "GLM_OFF":
+            state = set_execution_profile(root, sid, PROFILE_STABLE)
+        else:
+            state = set_mode(root, sid, action)
+        append_telemetry(
+            root,
+            {
+                "event": "routing_control_changed",
+                "mode": state["mode"],
+                "execution_profile": state["execution_profile"],
+                "session": state["session_key"][:12],
+            },
+        )
         replies = {
-            "ON": "已开启智能路由（仅当前会话）。边界清晰且适合委派的低风险任务会交给 Terra/Luna，高风险或不确定任务仍由 Sol 处理。",
+            "ON": "已开启智能路由（仅当前会话）。当前保留原执行配置；边界清晰且适合委派的轻任务交给 Luna，高风险或不确定任务仍由 Sol 处理。",
             "SHADOW": "已开启影子模式（仅当前会话）。后续只显示路由预览，不会实际委派。",
             "OFF": "已关闭智能路由（仅当前会话）。后续任务全部由 Sol 处理。",
+            "GLM_ON": "已开启 GLM_FIRST 智能路由（仅当前会话）。Luna 处理轻任务；复杂纯文本任务优先 GLM-5.3 Max；工作日 14:00–18:00、额度熔断或多模态时自动改用 Terra。",
+            "GLM_OFF": "已关闭当前会话的 GLM_FIRST，恢复 STABLE 执行配置；智能路由的 ON/OFF 状态不变。",
         }
         hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{replies[action]}"')
         return
     if action in {"STATUS", "HELP"}:
         if action == "HELP":
             reply = (
-                "当前会话可用命令：$router-control 开启、影子模式、关闭、状态。"
+                "当前会话可用命令：$router-control 开启、glm 开启、glm 关闭、影子模式、关闭、状态。"
                 "开启后自动判断；影子模式只预览；全局关闭请使用 /plugins。"
             )
         else:
@@ -203,13 +243,14 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
             "mode": state["mode"],
             "decision": decision["decision"],
             "role": decision.get("role"),
+            "execution_profile": state["execution_profile"],
             "risk": decision["risk"],
             "reason_codes": decision["reason_codes"],
             "prompt_sha256": prompt_digest(prompt),
             "session": state["session_key"][:12],
         },
     )
-    hook_context("UserPromptSubmit", routing_context(state["mode"], decision))
+    hook_context("UserPromptSubmit", routing_context(state["mode"], decision, state["execution_profile"]))
 
 
 def _tool_input(payload: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +279,26 @@ def _receipt_status(response: Any) -> str | None:
     return None
 
 
+def _receipt_meta(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    structured = response.get("structuredContent") or response.get("structured_content")
+    if isinstance(structured, dict) and isinstance(structured.get("_router_meta"), dict):
+        return dict(structured["_router_meta"])
+    content = response.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            try:
+                parsed = json.loads(item["text"])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("_router_meta"), dict):
+                return dict(parsed["_router_meta"])
+    return {}
+
+
 def on_pre_tool(payload: dict[str, Any]) -> None:
     tool_input = _tool_input(payload)
     tool_name = str(payload.get("tool_name") or payload.get("name") or "")
@@ -259,6 +320,21 @@ def on_pre_tool(payload: dict[str, Any]) -> None:
     decision = state.get("last_decision") or {}
     if decision.get("decision") != "DELEGATE" or decision.get("role") != role:
         deny_pretool("Requested routing agent does not match the current safety decision.")
+        return
+    requested_profile = str(tool_input.get("execution_profile") or PROFILE_STABLE).upper()
+    if is_wrapper and requested_profile != state.get("execution_profile", PROFILE_STABLE):
+        deny_pretool("Requested execution profile does not match the current session profile.")
+        return
+    if (
+        not is_wrapper
+        and state.get("execution_profile") == PROFILE_GLM_FIRST
+        and role in {"router_worker", "router_reviewer"}
+    ):
+        deny_pretool("GLM_FIRST worker/reviewer tasks must use smart_router.route_task for dynamic provider selection.")
+        return
+    images = tool_input.get("images") or []
+    if is_wrapper and images and role in {"router_scout", "router_monitor", "router_tester", "router_docs"}:
+        deny_pretool("Image inputs require a Terra-capable worker or reviewer role, not a Luna role.")
         return
     if role in WRITER_ROLES and not decision.get("write_authorized"):
         deny_pretool("Writable routing agents require explicit positive write authorization in the current task.")
@@ -323,6 +399,7 @@ def on_post_tool(payload: dict[str, Any]) -> None:
         return
     response = payload.get("tool_response")
     receipt_status = _receipt_status(response)
+    receipt_meta = _receipt_meta(response)
     failed = (
         isinstance(response, dict)
         and bool(response.get("isError") or response.get("is_error"))
@@ -335,6 +412,10 @@ def on_post_tool(payload: dict[str, Any]) -> None:
         "outcome": outcome,
         "tool_use_id": tool_use_id,
         "at": int(time.time()),
+        "model": receipt_meta.get("model"),
+        "route_label": receipt_meta.get("route_label"),
+        "provider": receipt_meta.get("provider"),
+        "fallback_reason": receipt_meta.get("fallback_reason"),
     }
     state["recent_execution_keys"] = [*recent, execution_key][-128:]
     released = False

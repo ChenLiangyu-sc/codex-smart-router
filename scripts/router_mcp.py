@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from provider_policy import EXECUTION_PROFILES, PROFILE_STABLE
 from run_agent import ROLE_SETTINGS, run_task
 
 
@@ -50,8 +51,12 @@ def reply(request_id: Any, result: dict[str, Any] | None = None, error: dict[str
 def tool_definition() -> dict[str, Any]:
     return {
         "name": "route_task",
-        "title": "Run one bounded Terra/Luna task",
-        "description": "Run one low-risk task with the exact SR_ON role. High-risk or mismatched work is rejected.",
+        "title": "Run one bounded routed task",
+        "description": (
+            "Run one low-risk task with the exact SR_ON role and execution profile. "
+            "Luna handles light roles; GLM_FIRST selects GLM-5.3 Max for eligible text work and "
+            "automatically uses Terra for peak windows, provider fallback, or attached images."
+        ),
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -59,6 +64,17 @@ def tool_definition() -> dict[str, Any]:
             "properties": {
                 "role": {"type": "string", "enum": sorted(ROLE_SETTINGS)},
                 "task": {"type": "string", "minLength": 1, "maxLength": 20000},
+                "execution_profile": {
+                    "type": "string",
+                    "enum": sorted(EXECUTION_PROFILES),
+                    "default": PROFILE_STABLE,
+                },
+                "images": {
+                    "type": "array",
+                    "maxItems": 5,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "description": "Local image paths needed by the task. Any image forces a multimodal Terra executor.",
+                },
             },
         },
     }
@@ -90,7 +106,16 @@ def handle(message: dict[str, Any]) -> None:
         try:
             if not routing_enabled():
                 raise PermissionError("Smart Router is globally disabled or locally parked")
-            receipt = run_task(str(args.get("role") or ""), str(args.get("task") or ""))
+            profile = str(args.get("execution_profile") or PROFILE_STABLE).upper()
+            images = args.get("images") or []
+            if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
+                raise ValueError("images must be an array of local path strings")
+            receipt = run_task(
+                str(args.get("role") or ""),
+                str(args.get("task") or ""),
+                execution_profile=profile,
+                images=images,
+            )
             failed = receipt.get("status") in {"blocked", "failed"}
             reply(
                 request_id,

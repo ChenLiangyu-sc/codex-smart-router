@@ -24,6 +24,9 @@ class RouterCoreTests(unittest.TestCase):
             "$router-control 状态": "STATUS",
             "$router-control 帮助": "HELP",
             "$router-control 开启。": "ON",
+            "$router-control glm 开启": "GLM_ON",
+            "/router glm on": "GLM_ON",
+            "$router-control glm 关闭": "GLM_OFF",
         }
         for prompt, expected in cases.items():
             with self.subTest(prompt=prompt):
@@ -185,7 +188,8 @@ class RouterCoreTests(unittest.TestCase):
             router_core._atomic_json(router_core.state_path(root, "s1"), state)
             loaded = router_core.load_state(root, "s1")
             self.assertEqual(loaded["mode"], "ON")
-            self.assertEqual(loaded["schema_version"], 3)
+            self.assertEqual(loaded["schema_version"], 4)
+            self.assertEqual(loaded["execution_profile"], "STABLE")
             self.assertEqual(loaded["execution_counts"], {"completed": 0, "failed": 0})
             self.assertEqual(loaded["recent_execution_keys"], [])
 
@@ -251,7 +255,7 @@ class RouterCoreTests(unittest.TestCase):
         scout = router_core.classify("搜索仓库并盘点相关文件")
         delegated = router_core.routing_context("ON", scout)
         self.assertLessEqual(len(delegated), 400)
-        self.assertIn("路由：Luna · 只读侦察", delegated)
+        self.assertIn("receipt._router_meta.route_label", delegated)
         self.assertIn("路由回退：Sol（委派未完成）", delegated)
 
         high_risk = router_core.classify("实现生产数据库迁移并部署")
@@ -262,6 +266,20 @@ class RouterCoreTests(unittest.TestCase):
         shadow = router_core.routing_context("SHADOW", scout)
         self.assertLessEqual(len(shadow), 240)
         self.assertIn("路由预览：Luna · 只读侦察", shadow)
+
+        worker = router_core.classify("实现这个边界清晰的小功能")
+        glm_shadow = router_core.routing_context("SHADOW", worker, "GLM_FIRST")
+        self.assertIn("GLM-5.3 Max / Terra", glm_shadow)
+
+    def test_execution_profile_persists_and_glm_on_activates_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = router_core.set_execution_profile(root, "s1", "GLM_FIRST", activate=True)
+            self.assertEqual(state["mode"], "ON")
+            self.assertEqual(state["execution_profile"], "GLM_FIRST")
+            state = router_core.set_execution_profile(root, "s1", "STABLE")
+            self.assertEqual(state["mode"], "ON")
+            self.assertEqual(state["execution_profile"], "STABLE")
 
 
 if __name__ == "__main__":

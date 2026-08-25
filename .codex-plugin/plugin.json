@@ -1,16 +1,16 @@
 {
   "name": "codex-smart-router",
-  "version": "0.1.0+codex.20260819095120",
-  "description": "Session-scoped, safety-first routing from GPT-5.6 Sol to Terra and Luna agents.",
+  "version": "0.2.0+codex.20260825130604",
+  "description": "Session-scoped, safety-first routing from GPT-5.6 Sol to GLM-5.3, Terra, and Luna agents.",
   "author": {
     "name": "chenliangyu"
   },
   "license": "MIT",
   "skills": "./skills/",
   "interface": {
-    "displayName": "Sol \u00b7 Terra \u00b7 Luna \u667a\u80fd\u8def\u7531",
+    "displayName": "Sol \u00b7 GLM \u00b7 Terra \u00b7 Luna \u667a\u80fd\u8def\u7531",
     "shortDescription": "\u5b89\u5168\u4f18\u5148\u3001\u4f1a\u8bdd\u7ea7\u5f00\u542f\u7684\u591a\u6a21\u578b\u4efb\u52a1\u8def\u7531",
-    "longDescription": "\u9ed8\u8ba4\u5173\u95ed\u3002\u7528\u6237\u5728\u5f53\u524d\u9879\u76ee\u4f1a\u8bdd\u4e2d\u5f00\u542f\u540e\uff0c\u63d2\u4ef6\u4f1a\u81ea\u52a8\u5224\u65ad\uff1a\u9002\u5408\u59d4\u6d3e\u7684\u4f4e\u98ce\u9669\u4efb\u52a1\u4ea4\u7ed9 Terra/Luna \u4e13\u7528 agent\uff0c\u9ad8\u98ce\u9669\u3001\u67b6\u6784\u6027\u6216\u4e0d\u786e\u5b9a\u4efb\u52a1\u4fdd\u7559\u7ed9 Sol\u3002",
+    "longDescription": "\u9ed8\u8ba4\u5173\u95ed\u3002\u7528\u6237\u53ef\u5728\u5f53\u524d\u4f1a\u8bdd\u542f\u7528 STABLE\uff0c\u6216\u542f\u7528 GLM_FIRST\uff1a\u8f7b\u4efb\u52a1\u4ea4\u7ed9 Luna\uff0c\u590d\u6742\u7eaf\u6587\u672c\u4efb\u52a1\u4f18\u5148 GLM-5.3 Max\uff0c\u9ad8\u5cf0\u3001\u989d\u5ea6\u5f02\u5e38\u4e0e\u591a\u6a21\u6001\u4efb\u52a1\u81ea\u52a8\u4f7f\u7528 Terra\uff1b\u9ad8\u98ce\u9669\u3001\u67b6\u6784\u6027\u6216\u4e0d\u786e\u5b9a\u4efb\u52a1\u4fdd\u7559\u7ed9 Sol\u3002",
     "developerName": "chenliangyu",
     "category": "Productivity",
     "capabilities": [
