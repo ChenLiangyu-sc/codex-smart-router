@@ -10,7 +10,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from provider_policy import EXECUTION_PROFILES, PROFILE_STABLE
+from provider_policy import (
+    EXECUTION_PROFILES,
+    LIGHT_PROFILES,
+    LIGHT_PROFILE_LUNA_STABLE,
+    PROFILE_STABLE,
+)
 from run_agent import ROLE_SETTINGS, run_task
 
 
@@ -54,7 +59,8 @@ def tool_definition() -> dict[str, Any]:
         "title": "Run one bounded routed task",
         "description": (
             "Run one low-risk task with the exact SR_ON role and execution profile. "
-            "Luna handles light roles; GLM_FIRST selects GLM-5.3 Max for eligible text work and "
+            "LUNA_STABLE handles light roles with Luna; LOCAL_TEXT_FIRST dynamically uses a configured text-only "
+            "provider for scout/monitor with Luna fallback. GLM_FIRST selects GLM-5.3 Max for eligible text work and "
             "automatically uses Terra for peak windows, provider fallback, or attached images."
         ),
         "inputSchema": {
@@ -68,6 +74,11 @@ def tool_definition() -> dict[str, Any]:
                     "type": "string",
                     "enum": sorted(EXECUTION_PROFILES),
                     "default": PROFILE_STABLE,
+                },
+                "light_profile": {
+                    "type": "string",
+                    "enum": sorted(LIGHT_PROFILES),
+                    "default": LIGHT_PROFILE_LUNA_STABLE,
                 },
                 "images": {
                     "type": "array",
@@ -107,6 +118,7 @@ def handle(message: dict[str, Any]) -> None:
             if not routing_enabled():
                 raise PermissionError("Smart Router is globally disabled or locally parked")
             profile = str(args.get("execution_profile") or PROFILE_STABLE).upper()
+            light_profile = str(args.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
             images = args.get("images") or []
             if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
                 raise ValueError("images must be an array of local path strings")
@@ -114,6 +126,7 @@ def handle(message: dict[str, Any]) -> None:
                 str(args.get("role") or ""),
                 str(args.get("task") or ""),
                 execution_profile=profile,
+                light_profile=light_profile,
                 images=images,
             )
             failed = receipt.get("status") in {"blocked", "failed"}

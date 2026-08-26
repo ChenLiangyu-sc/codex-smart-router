@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from install_agents import default_codex_home, inspect
+from local_provider import load_config as load_local_config, provider_key as local_provider_key, read_health as read_local_health
 from provider_policy import glm_key, is_peak_window, key_fingerprint, load_policy, read_health
 
 
@@ -42,6 +43,7 @@ def main() -> int:
     mcp_code, mcp_text = command("codex", "mcp", "get", "smart_router")
     key = glm_key(home=home)
     policy = load_policy(home)
+    local_config, local_reason = load_local_config(home)
     payload = {
         "codex_version": version_text,
         "version_supported": version_code == 0 and version_ok,
@@ -56,6 +58,16 @@ def main() -> int:
             "policy": {name: value for name, value in policy.items() if name != "invalid"},
             "policy_valid": not policy.get("invalid", False),
             "health": read_health(home),
+        },
+        "local_text": {
+            "configured": local_config is not None,
+            "configuration_status": local_reason,
+            "display_name": local_config.display_name if local_config else None,
+            "model": local_config.model if local_config else None,
+            "surrogate": local_config.surrogate if local_config else None,
+            "credential_required": bool(local_config and local_config.env_key),
+            "credential_configured": bool(local_config and (not local_config.env_key or local_provider_key(local_config, home=home))),
+            "health": read_local_health(home),
         },
         "plugin_data": os.environ.get("PLUGIN_DATA", "managed by Codex when installed"),
     }

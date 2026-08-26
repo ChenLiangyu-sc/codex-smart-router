@@ -14,6 +14,7 @@ HOOK = ROOT / "hooks" / "router_hook.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import router_core
+import local_provider
 
 
 class HookTests(unittest.TestCase):
@@ -180,7 +181,7 @@ class HookTests(unittest.TestCase):
         )
         status = self.call("user-prompt-submit", {"prompt": "$router-control 状态"}, env)
         status_text = status["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("执行配置：GLM_FIRST", status_text)
+        self.assertIn("重任务：GLM_FIRST", status_text)
         self.assertIn("最近建议：GLM-5.3 Max / Terra 动态执行", status_text)
 
         disabled = self.call(
@@ -192,6 +193,74 @@ class HookTests(unittest.TestCase):
         state = router_core.load_state(self.data, self.session)
         self.assertEqual(state["mode"], "ON")
         self.assertEqual(state["execution_profile"], "STABLE")
+
+    def test_local_profile_is_session_scoped_and_forces_dynamic_wrapper(self):
+        ready_home = self.ready_home("local-ready-home")
+        config = local_provider.LocalProviderConfig(
+            provider_id="local_text_test",
+            display_name="GLM-5.3 surrogate",
+            base_url="https://open.bigmodel.cn/api/v1",
+            model="glm-5.3",
+            env_key="ZHIPU_API_KEY",
+            surrogate="DeepSeek V4 Flash routing surrogate",
+        )
+        local_provider.write_config(config, ready_home)
+        secret = ready_home / "smart-router" / "providers.env"
+        secret.write_text("ZHIPU_API_KEY=test-key\n", encoding="utf-8")
+        os.chmod(secret, 0o600)
+        env = {"CODEX_HOME": str(ready_home)}
+
+        control = self.call("user-prompt-submit", {"prompt": "$router-control local 开启"}, env)
+        self.assertIn("LOCAL_TEXT_FIRST", control["hookSpecificOutput"]["additionalContext"])
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["mode"], "ON")
+        self.assertEqual(state["light_profile"], "LOCAL_TEXT_FIRST")
+
+        routed = self.call("user-prompt-submit", {"prompt": "搜索仓库并盘点文件"}, env)
+        context = routed["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("light=LOCAL_TEXT_FIRST", context)
+        native = self.call(
+            "pre-tool-use",
+            {"tool_input": {"agent_type": "router_scout", "fork_turns": "none"}},
+            env,
+        )
+        self.assertIn("smart_router.route_task", native["hookSpecificOutput"]["permissionDecisionReason"])
+        wrong = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_input": {
+                    "role": "router_scout",
+                    "task": "搜索仓库并盘点文件",
+                    "light_profile": "LUNA_STABLE",
+                },
+            },
+            env,
+        )
+        self.assertIn("light profile", wrong["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(
+            self.call(
+                "pre-tool-use",
+                {
+                    "tool_name": "mcp__smart_router__route_task",
+                    "tool_input": {
+                        "role": "router_scout",
+                        "task": "搜索仓库并盘点文件",
+                        "light_profile": "LOCAL_TEXT_FIRST",
+                    },
+                },
+                env,
+            )
+        )
+        status = self.call("user-prompt-submit", {"prompt": "$router-control 状态"}, env)
+        self.assertIn("轻任务：LOCAL_TEXT_FIRST", status["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("GLM-5.3 surrogate 可用", status["hookSpecificOutput"]["additionalContext"])
+
+        disabled = self.call("user-prompt-submit", {"prompt": "$router-control local 关闭"}, env)
+        self.assertIn("LUNA_STABLE", disabled["hookSpecificOutput"]["additionalContext"])
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["mode"], "ON")
+        self.assertEqual(state["light_profile"], "LUNA_STABLE")
 
     def test_glm_profile_keeps_luna_for_light_roles_and_rejects_images(self):
         ready_home = self.ready_home("glm-luna-home")

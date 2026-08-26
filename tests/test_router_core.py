@@ -27,6 +27,8 @@ class RouterCoreTests(unittest.TestCase):
             "$router-control glm 开启": "GLM_ON",
             "/router glm on": "GLM_ON",
             "$router-control glm 关闭": "GLM_OFF",
+            "$router-control local 开启": "LOCAL_ON",
+            "$router-control local 关闭": "LOCAL_OFF",
         }
         for prompt, expected in cases.items():
             with self.subTest(prompt=prompt):
@@ -188,8 +190,9 @@ class RouterCoreTests(unittest.TestCase):
             router_core._atomic_json(router_core.state_path(root, "s1"), state)
             loaded = router_core.load_state(root, "s1")
             self.assertEqual(loaded["mode"], "ON")
-            self.assertEqual(loaded["schema_version"], 4)
+            self.assertEqual(loaded["schema_version"], 5)
             self.assertEqual(loaded["execution_profile"], "STABLE")
+            self.assertEqual(loaded["light_profile"], "LUNA_STABLE")
             self.assertEqual(loaded["execution_counts"], {"completed": 0, "failed": 0})
             self.assertEqual(loaded["recent_execution_keys"], [])
 
@@ -280,6 +283,16 @@ class RouterCoreTests(unittest.TestCase):
             state = router_core.set_execution_profile(root, "s1", "STABLE")
             self.assertEqual(state["mode"], "ON")
             self.assertEqual(state["execution_profile"], "STABLE")
+
+    def test_light_profile_persists_and_local_on_activates_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = router_core.set_light_profile(root, "s1", "LOCAL_TEXT_FIRST", activate=True)
+            self.assertEqual(state["mode"], "ON")
+            self.assertEqual(state["light_profile"], "LOCAL_TEXT_FIRST")
+            state = router_core.set_light_profile(root, "s1", "LUNA_STABLE")
+            self.assertEqual(state["mode"], "ON")
+            self.assertEqual(state["light_profile"], "LUNA_STABLE")
 
 
 if __name__ == "__main__":

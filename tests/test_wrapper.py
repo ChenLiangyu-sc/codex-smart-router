@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run_agent
 import router_mcp
 import provider_policy
+import local_provider
 
 
 def valid_receipt():
@@ -35,6 +36,17 @@ def valid_receipt():
 
 
 class WrapperTests(unittest.TestCase):
+    def local_config(self, home, *, env_key="LOCAL_MODEL_API_KEY"):
+        config = local_provider.LocalProviderConfig(
+            provider_id="local_text_test",
+            display_name="Local Text Test",
+            base_url="http://127.0.0.1:8000/v1",
+            model="deepseek-v4-flash",
+            env_key=env_key,
+        )
+        local_provider.write_config(config, home)
+        return config
+
     def test_commands_pin_role_models(self):
         with tempfile.TemporaryDirectory() as tmp:
             for role, (model, effort, sandbox) in run_agent.ROLE_SETTINGS.items():
@@ -119,6 +131,8 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(set(roles), set(run_agent.ROLE_SETTINGS))
         profiles = tool["inputSchema"]["properties"]["execution_profile"]["enum"]
         self.assertEqual(set(profiles), provider_policy.EXECUTION_PROFILES)
+        light_profiles = tool["inputSchema"]["properties"]["light_profile"]["enum"]
+        self.assertEqual(set(light_profiles), provider_policy.LIGHT_PROFILES)
 
     def test_glm_first_uses_glm_max_outside_peak(self):
         calls = []
@@ -162,6 +176,132 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(key, "test-key")
         self.assertEqual(environment[provider_policy.GLM_ENV_KEY], "test-key")
         self.assertEqual(environment.get("PATH"), os.environ.get("PATH"))
+
+    def test_local_text_first_uses_custom_responses_provider_without_key_in_command(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs["env"]))
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                receipt = run_agent.run_task(
+                    "router_scout",
+                    "搜索仓库中的测试文件",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    env={"LOCAL_MODEL_API_KEY": "test-local-key"},
+                    codex_home=tmp,
+                )
+        command, child_env = calls[0]
+        self.assertEqual(receipt["_router_meta"]["executor"], "local_scout")
+        self.assertEqual(receipt["_router_meta"]["model"], "deepseek-v4-flash")
+        self.assertEqual(receipt["_router_meta"]["requested_light_profile"], "LOCAL_TEXT_FIRST")
+        self.assertIn('model_provider="local_text_test"', command)
+        self.assertIn('model_providers.local_text_test.wire_api="responses"', command)
+        self.assertIn('model_providers.local_text_test.env_key="LOCAL_MODEL_API_KEY"', command)
+        self.assertIn("^LOCAL_MODEL_API_KEY$", " ".join(command))
+        self.assertNotIn("test-local-key", " ".join(command))
+        self.assertEqual(child_env["LOCAL_MODEL_API_KEY"], "test-local-key")
+
+    def test_local_runtime_failure_falls_back_to_luna_and_opens_only_local_circuit(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if "deepseek-v4-flash" in command:
+                return subprocess.CompletedProcess(command, 1, "", "connection refused")
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                receipt = run_agent.run_task(
+                    "router_scout",
+                    "搜索仓库中的测试文件",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    env={"LOCAL_MODEL_API_KEY": "test-local-key"},
+                    codex_home=tmp,
+                )
+            local_health = local_provider.read_health(tmp)
+            glm_health = provider_policy.read_health(tmp)
+        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_runtime_failure")
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["local_scout", "luna_scout"])
+        self.assertEqual(local_health["state"], "open")
+        self.assertEqual(glm_health["state"], "closed")
+        self.assertEqual(len(calls), 2)
+
+    def test_local_invalid_receipt_falls_back_to_luna(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            output = Path(command[command.index("--output-last-message") + 1])
+            receipt = valid_receipt()
+            if "deepseek-v4-flash" in command:
+                receipt["evidence"] = [f"item-{index}" for index in range(7)]
+            output.write_text(json.dumps(receipt), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                receipt = run_agent.run_task(
+                    "router_scout",
+                    "搜索仓库中的测试文件",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    env={"LOCAL_MODEL_API_KEY": "test-local-key"},
+                    codex_home=tmp,
+                )
+        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_runtime_failure")
+        self.assertEqual(len(calls), 2)
+
+    def test_local_no_auth_provider_is_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.local_config(tmp, env_key=None)
+            resolution = provider_policy.resolve_executor(
+                "router_monitor", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
+            )
+            environment, key = run_agent._child_env(resolution.executor, {}, tmp)
+            command = run_agent.build_command(
+                "router_monitor", Path(tmp) / "receipt.json", resolution.executor, home=tmp
+            )
+        self.assertIsNone(key)
+        self.assertNotIn("model_providers.local_text_test.env_key", " ".join(command))
+
+    def test_local_config_change_after_resolution_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            resolution = provider_policy.resolve_executor(
+                "router_scout",
+                light_profile="LOCAL_TEXT_FIRST",
+                env={"LOCAL_MODEL_API_KEY": "old-key"},
+                home=tmp,
+            )
+            changed = local_provider.LocalProviderConfig(
+                provider_id="local_text_test",
+                display_name="Changed Local Text",
+                base_url="https://example.invalid/v1",
+                model="deepseek-v4-flash",
+                env_key="LOCAL_MODEL_API_KEY",
+            )
+            local_provider.write_config(changed, tmp)
+            with self.assertRaisesRegex(run_agent.ChildFailure, "configuration changed"):
+                run_agent._child_env(resolution.executor, {"LOCAL_MODEL_API_KEY": "new-key"}, tmp)
+            with self.assertRaisesRegex(run_agent.ChildFailure, "configuration changed"):
+                run_agent.build_command(
+                    "router_scout",
+                    Path(tmp) / "receipt.json",
+                    resolution.executor,
+                    home=tmp,
+                )
 
     def test_glm_quota_error_falls_back_to_terra_and_opens_circuit(self):
         child_calls = []

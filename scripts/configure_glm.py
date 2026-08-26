@@ -14,11 +14,18 @@ from provider_policy import GLM_ENV_KEY, key_fingerprint, secret_path
 def write_secret(value: str) -> None:
     path = secret_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    existing: list[str] = []
+    if path.exists():
+        if path.stat().st_mode & 0o077:
+            raise PermissionError(f"refusing to update non-private credential file: {path}")
+        existing = path.read_text(encoding="utf-8").splitlines()
+    preserved = [line for line in existing if not line.strip().startswith(f"{GLM_ENV_KEY}=")]
+    preserved.append(f"{GLM_ENV_KEY}={value}")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(f"{GLM_ENV_KEY}={value}\n")
+            stream.write("\n".join(preserved) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp_name, path)

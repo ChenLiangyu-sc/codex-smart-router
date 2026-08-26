@@ -17,9 +17,12 @@ from typing import Any, Mapping
 from provider_policy import (
     EXECUTION_PROFILES,
     EXECUTORS,
-    GLM_BASE_URL,
     GLM_ENV_KEY,
     GLM_PROVIDER_ID,
+    LIGHT_PROFILES,
+    LIGHT_PROFILE_LOCAL_TEXT_FIRST,
+    LIGHT_PROFILE_LUNA_STABLE,
+    LOCAL_TEXT_ELIGIBLE_ROLES,
     PROFILE_STABLE,
     ExecutorSpec,
     glm_key,
@@ -27,6 +30,13 @@ from provider_policy import (
     record_glm_success,
     redact_secrets,
     resolve_executor,
+)
+from local_provider import (
+    config_fingerprint as local_config_fingerprint,
+    load_config as load_local_config,
+    provider_key as local_provider_key,
+    record_failure as record_local_failure,
+    record_success as record_local_success,
 )
 from router_core import (
     ROLES,
@@ -92,10 +102,25 @@ def build_command(
     output_path: Path,
     executor: ExecutorSpec | None = None,
     images: list[Path] | None = None,
+    home: str | Path | None = None,
 ) -> list[str]:
     if executor is None:
         model, effort, sandbox = ROLE_SETTINGS[role]
         executor = ExecutorSpec("stable_compat", "openai", model, effort, sandbox, model)
+    local_config, _ = load_local_config(home)
+    if executor.provider not in {"openai", GLM_PROVIDER_ID}:
+        if (
+            local_config is None
+            or local_config.provider_id != executor.provider
+            or local_config_fingerprint(local_config) != executor.provider_fingerprint
+        ):
+            raise ChildFailure("local provider configuration changed before command construction")
+    excluded_keys = {GLM_ENV_KEY}
+    if local_config is not None and local_config.env_key:
+        excluded_keys.add(local_config.env_key)
+    if executor.env_key:
+        excluded_keys.add(executor.env_key)
+    exclude_config = json.dumps([f"^{re.escape(key)}$" for key in sorted(excluded_keys)])
     command = [
         "codex",
         "exec",
@@ -133,25 +158,31 @@ def build_command(
         "--config",
         "shell_environment_policy.ignore_default_excludes=false",
         "--config",
-        'shell_environment_policy.exclude=["^ZHIPU_API_KEY$"]',
+        f"shell_environment_policy.exclude={exclude_config}",
     ]
-    if executor.provider == GLM_PROVIDER_ID:
+    if executor.provider != "openai":
+        if not executor.provider_name or not executor.base_url:
+            raise ValueError(f"custom provider metadata is incomplete for {executor.id}")
+        catalog = str(GLM_CATALOG) if executor.provider == GLM_PROVIDER_ID else executor.model_catalog
+        provider = executor.provider
         command.extend(
             [
                 "--config",
-                f'model_provider="{GLM_PROVIDER_ID}"',
+                f"model_provider={json.dumps(provider)}",
                 "--config",
-                f'model_providers.{GLM_PROVIDER_ID}.name="Zhipu GLM Coding Plan"',
+                f"model_providers.{provider}.name={json.dumps(executor.provider_name, ensure_ascii=False)}",
                 "--config",
-                f'model_providers.{GLM_PROVIDER_ID}.base_url="{GLM_BASE_URL}"',
+                f"model_providers.{provider}.base_url={json.dumps(executor.base_url)}",
                 "--config",
-                f'model_providers.{GLM_PROVIDER_ID}.env_key="{GLM_ENV_KEY}"',
-                "--config",
-                f'model_providers.{GLM_PROVIDER_ID}.wire_api="responses"',
-                "--config",
-                f'model_catalog_json="{GLM_CATALOG}"',
+                f"model_providers.{provider}.wire_api={json.dumps(executor.wire_api)}",
             ]
         )
+        if executor.env_key:
+            command.extend(
+                ["--config", f"model_providers.{provider}.env_key={json.dumps(executor.env_key)}"]
+            )
+        if catalog:
+            command.extend(["--config", f"model_catalog_json={json.dumps(str(catalog))}"])
     for image in images or []:
         command.extend(["--image", str(image)])
     command.extend(
@@ -174,13 +205,30 @@ def _child_env(
     environment = dict(os.environ)
     if source is not None:
         environment.update(source)
+    local_config, _ = load_local_config(home)
+    known_keys = {GLM_ENV_KEY}
+    if local_config is not None and local_config.env_key:
+        known_keys.add(local_config.env_key)
     key = glm_key(environment, home) if executor.provider == GLM_PROVIDER_ID else None
+    if executor.provider != "openai" and executor.provider != GLM_PROVIDER_ID:
+        if (
+            local_config is None
+            or local_config.provider_id != executor.provider
+            or local_config_fingerprint(local_config) != executor.provider_fingerprint
+        ):
+            raise ChildFailure("local provider configuration changed before execution")
+        key = local_provider_key(local_config, environment, home)
     if executor.provider == GLM_PROVIDER_ID:
         if not key:
             raise ChildFailure("GLM credential is unavailable")
         environment[GLM_ENV_KEY] = key
+    elif executor.provider != "openai" and executor.env_key:
+        if not key:
+            raise ChildFailure("local provider credential is unavailable")
+        environment[executor.env_key] = key
     else:
-        environment.pop(GLM_ENV_KEY, None)
+        for name in known_keys:
+            environment.pop(name, None)
     return environment, key
 
 
@@ -263,7 +311,9 @@ def _invoke(
         + "\n\nAssigned task:\n"
         + task
         + "\n\nDo not spawn subagents. Return only the required receipt JSON. Keep summary within two sentences; "
-        "include only decision-relevant evidence and no process narration. Keep each findings/evidence item under 700 "
+        "include only decision-relevant evidence and no process narration. Use at most six findings and six evidence "
+        "items, at most eight changed_files, and at most six validation/remaining_risks items. Keep each "
+        "findings/evidence item under 700 "
         "characters, validation/remaining_risks item under 500, and changed_files path under 250. End every item "
         "at a complete sentence or path boundary. Never spill field names or continuation fragments into a new item."
     )
@@ -271,7 +321,7 @@ def _invoke(
     environment, key = _child_env(executor, env_source, home)
     with tempfile.TemporaryDirectory(prefix="codex-smart-router-") as tmp:
         output = Path(tmp) / "receipt.json"
-        command = build_command(role, output, executor, images)
+        command = build_command(role, output, executor, images, home)
         try:
             result = subprocess.run(
                 command,
@@ -314,6 +364,7 @@ def run_task(
     workspace: str | Path | None = None,
     *,
     execution_profile: str = PROFILE_STABLE,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
     images: list[str] | tuple[str, ...] | None = None,
     now: dt.datetime | None = None,
     env: Mapping[str, str] | None = None,
@@ -324,6 +375,9 @@ def run_task(
     profile = execution_profile.upper()
     if profile not in EXECUTION_PROFILES:
         raise ValueError(f"unsupported execution profile: {execution_profile}")
+    normalized_light = light_profile.upper()
+    if normalized_light not in LIGHT_PROFILES:
+        raise ValueError(f"unsupported light profile: {light_profile}")
     safety = classify(task)
     if safety["risk"] == "HIGH":
         raise ValueError("high-risk task must remain with the main Sol agent")
@@ -336,6 +390,7 @@ def run_task(
     resolution = resolve_executor(
         role,
         profile,
+        light_profile=normalized_light,
         has_images=bool(image_paths),
         now=now,
         env=env,
@@ -347,6 +402,12 @@ def run_task(
         if resolution.executor.provider != GLM_PROVIDER_ID and profile != PROFILE_STABLE and role not in {"router_scout", "router_monitor", "router_tester", "router_docs"}
         else None
     )
+    if (
+        normalized_light == LIGHT_PROFILE_LOCAL_TEXT_FIRST
+        and role in LOCAL_TEXT_ELIGIBLE_ROLES
+        and not resolution.local_available
+    ):
+        fallback_reason = resolution.reason
 
     def execute(executor: ExecutorSpec) -> tuple[str, str | None]:
         attempts.append(executor.id)
@@ -356,14 +417,38 @@ def run_task(
         executor = resolution.executor
         try:
             raw, _ = execute(executor)
+            if resolution.local_available:
+                valid_local, local_errors, _ = validate_receipt(raw)
+                if not valid_local:
+                    raise ChildFailure("local provider returned an invalid receipt: " + "; ".join(local_errors))
             if executor.provider == GLM_PROVIDER_ID:
                 record_glm_success(
                     codex_home,
                     int(now.timestamp()) if now is not None else None,
                     expected_generation=resolution.health_generation,
                 )
+            elif resolution.local_available and resolution.local_config is not None:
+                record_local_success(
+                    resolution.local_config,
+                    codex_home,
+                    int(now.timestamp()) if now is not None else None,
+                    expected_generation=resolution.health_generation,
+                )
             return raw, executor, fallback_reason
         except ChildFailure as exc:
+            if resolution.local_available and resolution.local_config is not None:
+                key = local_provider_key(resolution.local_config, env, codex_home)
+                record_local_failure(
+                    resolution.local_config,
+                    exc.detail,
+                    key,
+                    codex_home,
+                    int(now.timestamp()) if now is not None else None,
+                    expected_generation=resolution.health_generation,
+                )
+                fallback = EXECUTORS["luna_scout" if role == "router_scout" else "luna_monitor"]
+                raw, _ = execute(fallback)
+                return raw, fallback, "local_runtime_failure"
             if executor.provider != GLM_PROVIDER_ID:
                 raise
             key = glm_key(env, codex_home)
@@ -394,6 +479,7 @@ def run_task(
         "executor": executor.id,
         "route_label": executor.route_label,
         "requested_profile": profile,
+        "requested_light_profile": normalized_light,
         "selection_reason": resolution.reason,
         "fallback_reason": actual_fallback_reason,
         "attempted_executors": attempts,
@@ -407,11 +493,19 @@ def main() -> int:
     parser.add_argument("--task", help="Bounded task; stdin is used when omitted")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--profile", choices=sorted(EXECUTION_PROFILES), default=PROFILE_STABLE)
+    parser.add_argument("--light-profile", choices=sorted(LIGHT_PROFILES), default=LIGHT_PROFILE_LUNA_STABLE)
     parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args()
     task = args.task if args.task is not None else __import__("sys").stdin.read()
     try:
-        receipt = run_task(args.role, task, args.timeout, execution_profile=args.profile, images=args.image)
+        receipt = run_task(
+            args.role,
+            task,
+            args.timeout,
+            execution_profile=args.profile,
+            light_profile=args.light_profile,
+            images=args.image,
+        )
     except Exception as exc:
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
         return 1

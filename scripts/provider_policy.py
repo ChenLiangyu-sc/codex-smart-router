@@ -17,10 +17,23 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from local_provider import (
+    LocalProviderConfig,
+    config_fingerprint as local_config_fingerprint,
+    health_available as local_health_available,
+    load_config as load_local_config,
+    model_catalog_path as local_model_catalog_path,
+    provider_key as local_provider_key,
+)
+
 
 PROFILE_STABLE = "STABLE"
 PROFILE_GLM_FIRST = "GLM_FIRST"
 EXECUTION_PROFILES = {PROFILE_STABLE, PROFILE_GLM_FIRST}
+
+LIGHT_PROFILE_LUNA_STABLE = "LUNA_STABLE"
+LIGHT_PROFILE_LOCAL_TEXT_FIRST = "LOCAL_TEXT_FIRST"
+LIGHT_PROFILES = {LIGHT_PROFILE_LUNA_STABLE, LIGHT_PROFILE_LOCAL_TEXT_FIRST}
 
 GLM_ENV_KEY = "ZHIPU_API_KEY"
 GLM_PROVIDER_ID = "zhipu_glm_coding"
@@ -28,6 +41,7 @@ GLM_BASE_URL = "https://open.bigmodel.cn/api/v1"
 GLM_MODEL = "glm-5.3"
 
 LUNA_ROLES = {"router_scout", "router_monitor", "router_tester", "router_docs"}
+LOCAL_TEXT_ELIGIBLE_ROLES = {"router_scout", "router_monitor"}
 GLM_ELIGIBLE_ROLES = {"router_worker", "router_reviewer"}
 
 QUOTA_5H_CODES = {1308, 1316, 1318, 1320}
@@ -46,6 +60,12 @@ class ExecutorSpec:
     reasoning_effort: str
     sandbox: str
     route_label: str
+    provider_name: str | None = None
+    base_url: str | None = None
+    env_key: str | None = None
+    wire_api: str = "responses"
+    model_catalog: str | None = None
+    provider_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +75,9 @@ class Resolution:
     reason: str
     glm_available: bool
     health_generation: int = 0
+    requested_light_profile: str = LIGHT_PROFILE_LUNA_STABLE
+    local_available: bool = False
+    local_config: LocalProviderConfig | None = None
 
 
 EXECUTORS = {
@@ -64,8 +87,14 @@ EXECUTORS = {
     "luna_docs": ExecutorSpec("luna_docs", "openai", "gpt-5.6-luna", "medium", "workspace-write", "Luna · 文档"),
     "terra_worker": ExecutorSpec("terra_worker", "openai", "gpt-5.6-terra", "medium", "workspace-write", "Terra · 执行"),
     "terra_reviewer": ExecutorSpec("terra_reviewer", "openai", "gpt-5.6-terra", "high", "read-only", "Terra · 审查"),
-    "glm_worker": ExecutorSpec("glm_worker", GLM_PROVIDER_ID, GLM_MODEL, "max", "workspace-write", "GLM-5.3 Max · 执行"),
-    "glm_reviewer": ExecutorSpec("glm_reviewer", GLM_PROVIDER_ID, GLM_MODEL, "max", "read-only", "GLM-5.3 Max · 审查"),
+    "glm_worker": ExecutorSpec(
+        "glm_worker", GLM_PROVIDER_ID, GLM_MODEL, "max", "workspace-write", "GLM-5.3 Max · 执行",
+        "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+    ),
+    "glm_reviewer": ExecutorSpec(
+        "glm_reviewer", GLM_PROVIDER_ID, GLM_MODEL, "max", "read-only", "GLM-5.3 Max · 审查",
+        "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+    ),
 }
 
 ROLE_EXECUTORS = {
@@ -432,6 +461,7 @@ def resolve_executor(
     role: str,
     profile: str = PROFILE_STABLE,
     *,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
     has_images: bool = False,
     now: dt.datetime | None = None,
     env: Mapping[str, str] | None = None,
@@ -440,37 +470,113 @@ def resolve_executor(
     normalized = profile.upper()
     if normalized not in EXECUTION_PROFILES:
         raise ValueError(f"unsupported execution profile: {profile}")
+    normalized_light = light_profile.upper()
+    if normalized_light not in LIGHT_PROFILES:
+        raise ValueError(f"unsupported light profile: {light_profile}")
     if role in ROLE_EXECUTORS:
-        return Resolution(EXECUTORS[ROLE_EXECUTORS[role]], normalized, "luna_role", False)
+        luna = EXECUTORS[ROLE_EXECUTORS[role]]
+        if role not in LOCAL_TEXT_ELIGIBLE_ROLES or normalized_light != LIGHT_PROFILE_LOCAL_TEXT_FIRST:
+            return Resolution(
+                luna,
+                normalized,
+                "luna_role",
+                False,
+                requested_light_profile=normalized_light,
+            )
+        config, config_reason = load_local_config(home)
+        if config is None:
+            return Resolution(
+                luna,
+                normalized,
+                f"local_config_{config_reason}",
+                False,
+                requested_light_profile=normalized_light,
+            )
+        key = local_provider_key(config, env, home)
+        if config.env_key and not key:
+            return Resolution(
+                luna,
+                normalized,
+                "local_key_missing",
+                False,
+                requested_light_profile=normalized_light,
+                local_config=config,
+            )
+        epoch = int(now.timestamp()) if now is not None else int(time.time())
+        available, reason, health = local_health_available(config, key, epoch, home)
+        if not available:
+            return Resolution(
+                luna,
+                normalized,
+                f"local_{reason}",
+                False,
+                requested_light_profile=normalized_light,
+                local_config=config,
+            )
+        role_suffix = "scout" if role == "router_scout" else "monitor"
+        role_label = "只读侦察" if role == "router_scout" else "监控"
+        executor = ExecutorSpec(
+            f"local_{role_suffix}",
+            config.provider_id,
+            config.model,
+            config.reasoning_effort,
+            "read-only",
+            f"{config.display_name} · {role_label}",
+            config.display_name,
+            config.base_url,
+            config.env_key,
+            config.wire_api,
+            str(local_model_catalog_path(home)),
+            local_config_fingerprint(config),
+        )
+        return Resolution(
+            executor,
+            normalized,
+            reason,
+            False,
+            int(health.get("generation") or 0),
+            normalized_light,
+            True,
+            config,
+        )
     if role not in GLM_ELIGIBLE_ROLES:
         raise ValueError(f"unknown role: {role}")
     terra = EXECUTORS["terra_worker" if role == "router_worker" else "terra_reviewer"]
     glm = EXECUTORS["glm_worker" if role == "router_worker" else "glm_reviewer"]
     if normalized != PROFILE_GLM_FIRST:
-        return Resolution(terra, normalized, "stable_profile", False)
+        return Resolution(terra, normalized, "stable_profile", False, requested_light_profile=normalized_light)
     if has_images:
-        return Resolution(terra, normalized, "multimodal_requires_terra", False)
+        return Resolution(terra, normalized, "multimodal_requires_terra", False, requested_light_profile=normalized_light)
     policy = load_policy(home)
     if policy.get("invalid"):
-        return Resolution(terra, normalized, "invalid_policy", False)
+        return Resolution(terra, normalized, "invalid_policy", False, requested_light_profile=normalized_light)
     if is_peak_window(now, policy):
-        return Resolution(terra, normalized, "glm_peak_window", False)
+        return Resolution(terra, normalized, "glm_peak_window", False, requested_light_profile=normalized_light)
     key = glm_key(env, home)
     if not key:
-        return Resolution(terra, normalized, "glm_key_missing", False)
+        return Resolution(terra, normalized, "glm_key_missing", False, requested_light_profile=normalized_light)
     epoch = int(local_now(policy, now).timestamp()) if now is not None else int(time.time())
     available, reason, health = glm_health_available(key, epoch, home)
     if not available:
-        return Resolution(terra, normalized, f"glm_{reason}", False)
-    return Resolution(glm, normalized, reason, True, int(health.get("generation") or 0))
+        return Resolution(terra, normalized, f"glm_{reason}", False, requested_light_profile=normalized_light)
+    return Resolution(
+        glm,
+        normalized,
+        reason,
+        True,
+        int(health.get("generation") or 0),
+        normalized_light,
+    )
 
 
 def resolution_dict(value: Resolution) -> dict[str, Any]:
     return {
         "executor": asdict(value.executor),
         "requested_profile": value.requested_profile,
+        "requested_light_profile": value.requested_light_profile,
         "reason": value.reason,
         "glm_available": value.glm_available,
+        "local_available": value.local_available,
         "health_generation": value.health_generation,
     }
 

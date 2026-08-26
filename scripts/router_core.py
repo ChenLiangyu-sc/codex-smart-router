@@ -14,7 +14,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from provider_policy import EXECUTION_PROFILES, PROFILE_GLM_FIRST, PROFILE_STABLE
+from provider_policy import (
+    EXECUTION_PROFILES,
+    LIGHT_PROFILES,
+    LIGHT_PROFILE_LOCAL_TEXT_FIRST,
+    LIGHT_PROFILE_LUNA_STABLE,
+    PROFILE_GLM_FIRST,
+    PROFILE_STABLE,
+)
 
 PLUGIN_ID = "codex-smart-router"
 MODES = {"OFF", "SHADOW", "ON"}
@@ -90,6 +97,10 @@ SECURITY_AUTHORIZATION_ACTION = re.compile(
 )
 
 CONTROL_PATTERNS = (
+    (re.compile(r"\$router-control\s*(?:local\s*(?:开启|启用|on)|(?:开启|启用)\s*local)\b", re.I), "LOCAL_ON"),
+    (re.compile(r"/router\s+local\s+on\b", re.I), "LOCAL_ON"),
+    (re.compile(r"\$router-control\s*(?:local\s*(?:关闭|停用|off)|(?:关闭|停用)\s*local)\b", re.I), "LOCAL_OFF"),
+    (re.compile(r"/router\s+local\s+off\b", re.I), "LOCAL_OFF"),
     (re.compile(r"\$router-control\s*(?:glm\s*(?:开启|启用|on)|(?:开启|启用)\s*glm)\b", re.I), "GLM_ON"),
     (re.compile(r"/router\s+glm\s+on\b", re.I), "GLM_ON"),
     (re.compile(r"\$router-control\s*(?:glm\s*(?:关闭|停用|off)|(?:关闭|停用)\s*glm)\b", re.I), "GLM_OFF"),
@@ -243,10 +254,11 @@ def state_path(root: Path, session_id: str) -> Path:
 def default_state(session_id: str) -> dict[str, Any]:
     now = int(time.time())
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "session_key": session_key(session_id),
         "mode": "OFF",
         "execution_profile": PROFILE_STABLE,
+        "light_profile": LIGHT_PROFILE_LUNA_STABLE,
         "created_at": now,
         "updated_at": now,
         "last_decision": None,
@@ -286,9 +298,11 @@ def load_state(root: Path, session_id: str) -> dict[str, Any]:
         return default_state(session_id)
     # Additive migration keeps an existing session's mode while enabling newer
     # user-facing execution history.
-    state["schema_version"] = 4
+    state["schema_version"] = 5
     profile = str(state.get("execution_profile") or PROFILE_STABLE).upper()
     state["execution_profile"] = profile if profile in EXECUTION_PROFILES else PROFILE_STABLE
+    light_profile = str(state.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
+    state["light_profile"] = light_profile if light_profile in LIGHT_PROFILES else LIGHT_PROFILE_LUNA_STABLE
     counts = state.get("execution_counts")
     if not isinstance(counts, dict):
         counts = {}
@@ -348,6 +362,26 @@ def set_execution_profile(
         raise ValueError(f"unsupported execution profile: {profile}")
     state = load_state(root, session_id)
     state["execution_profile"] = normalized
+    if activate:
+        state["mode"] = "ON"
+    state["last_decision"] = None
+    state["repair_attempts"] = 0
+    save_state(root, session_id, state)
+    return state
+
+
+def set_light_profile(
+    root: Path,
+    session_id: str,
+    profile: str,
+    *,
+    activate: bool = False,
+) -> dict[str, Any]:
+    normalized = profile.upper()
+    if normalized not in LIGHT_PROFILES:
+        raise ValueError(f"unsupported light profile: {profile}")
+    state = load_state(root, session_id)
+    state["light_profile"] = normalized
     if activate:
         state["mode"] = "ON"
     state["last_decision"] = None
@@ -626,13 +660,20 @@ def validate_receipt(raw: str) -> tuple[bool, list[str], dict[str, Any] | None]:
     return not errors, errors, receipt
 
 
-def routing_context(mode: str, decision: dict[str, Any], execution_profile: str = PROFILE_STABLE) -> str:
+def routing_context(
+    mode: str,
+    decision: dict[str, Any],
+    execution_profile: str = PROFILE_STABLE,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+) -> str:
     role = decision.get("role") or "main_sol"
     if mode == "SHADOW":
         if decision["decision"] != "DELEGATE":
             recommendation = "Sol"
         elif execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
             recommendation = "GLM-5.3 Max / Terra 动态执行"
+        elif light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and role in {"router_scout", "router_monitor"}:
+            recommendation = "Local Text / Luna 动态执行"
         else:
             recommendation = ROLE_LABELS.get(role, "Sol")
         return (
@@ -643,8 +684,9 @@ def routing_context(mode: str, decision: dict[str, Any], execution_profile: str 
         return f"SR_ON INLINE_SOL risk={decision['risk']}. Do not delegate; handle normally in Sol without a route label."
     write_flag = "1" if decision.get("write_authorized") else "0"
     return (
-        f"SR_ON DELEGATE role={role} profile={execution_profile} write={write_flag}. Call smart_router.route_task once "
-        "with these exact role/profile values, a bounded task, and only required image paths; no subagents. "
+        f"SR_ON DELEGATE role={role} profile={execution_profile} light={light_profile} write={write_flag}. "
+        "Call smart_router.route_task once with these exact role/profile/light_profile values, a bounded task, "
+        "and only required image paths; no subagents. "
         "Integrate the receipt. If completed, append `路由：` plus exact receipt._router_meta.route_label. "
         "If blocked/failed/error, continue in Sol and end with "
         'exactly: "路由回退：Sol（委派未完成）".'
