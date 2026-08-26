@@ -44,6 +44,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(config.splitlines().count(install_agents.CONFIG_BEGIN), 1)
         self.assertEqual(config.splitlines().count(install_agents.MCP_BEGIN), 1)
         self.assertIn("[mcp_servers.smart_router]", config)
+        self.assertIn(f"tool_timeout_sec = {install_agents.MCP_TOOL_TIMEOUT_SEC}", config)
         runtime_root = self.home / install_agents.RUNTIME_SUBDIR
         self.assertTrue(runtime_root.is_symlink())
         self.assertIn(str(runtime_root / "scripts" / "router_mcp.py"), config)
@@ -56,6 +57,109 @@ class InstallerTests(unittest.TestCase):
         for source in install_agents.source_files():
             self.assertIn(f"{source.stem} = {{", config)
             self.assertIn(str((self.home / "agents" / source.name).resolve()), config)
+
+    def _inject_codex_hooks_state_into_mcp_block(self) -> str:
+        hooks = (
+            "\n[hooks.state]\n\n"
+            '[hooks.state."codex-smart-router@personal:hooks/hooks.json:user_prompt_submit:0:0"]\n'
+            f'trusted_hash = "sha256:{"a" * 64}"\n\n'
+        )
+        config_path = self.home / "config.toml"
+        text = config_path.read_text(encoding="utf-8")
+        config_path.write_text(text.replace(install_agents.MCP_END, hooks + install_agents.MCP_END, 1), encoding="utf-8")
+        return hooks
+
+    def test_reinstall_preserves_codex_hooks_state_inside_managed_mcp_markers(self):
+        errors, _ = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0)
+        hooks = self._inject_codex_hooks_state_into_mcp_block()
+        errors, messages = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0, messages)
+        config = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertEqual(config.count("[hooks.state]"), 1)
+        self.assertIn(hooks.strip(), config)
+        self.assertLess(config.index("[hooks.state]"), config.index(install_agents.MCP_BEGIN))
+
+    def test_reinstall_fails_closed_on_non_hooks_drift_inside_mcp_markers(self):
+        errors, _ = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0)
+        config_path = self.home / "config.toml"
+        original = config_path.read_text(encoding="utf-8")
+        drifted = original.replace(install_agents.MCP_END, "unexpected_setting = true\n" + install_agents.MCP_END, 1)
+        config_path.write_text(drifted, encoding="utf-8")
+        errors, messages = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 1)
+        self.assertTrue(any("previously managed MCP fragment was modified" in message for message in messages))
+        self.assertEqual(config_path.read_text(encoding="utf-8"), drifted)
+        manifest = install_agents.load_manifest(self.home / "smart-router" / "installed.json")
+        errors, messages = install_agents.check_uninstall_config(self.home, manifest)
+        self.assertEqual(errors, 1)
+        self.assertTrue(any("managed fragment missing or modified" in message for message in messages))
+
+    def test_v040_upgrade_preview_keeps_mcp_long_timeout(self):
+        errors, _ = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0)
+        manifest_path = self.home / "smart-router" / "installed.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        server = str(self.home / install_agents.RUNTIME_SUBDIR / "scripts" / "router_mcp.py")
+        v040_mcp_fragment = (
+            f"\n\n{install_agents.MCP_BEGIN}\n[mcp_servers.smart_router]\n"
+            f'command = "python3"\nargs = [{json.dumps(server)}]\n'
+            "tool_timeout_sec = 1200\n"
+            f"{install_agents.MCP_END}\n"
+        )
+        config_path = self.home / "config.toml"
+        config = config_path.read_text(encoding="utf-8")
+        config_path.write_text(
+            config.replace(manifest["config"]["mcp_fragment"], v040_mcp_fragment, 1),
+            encoding="utf-8",
+        )
+        manifest["config"]["mcp_fragment"] = v040_mcp_fragment
+        manifest["plugin_version"] = "0.4.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        errors, messages = install_agents.install(self.home, apply=False)
+        self.assertEqual(errors, 0, messages)
+        preview = "\n".join(messages)
+        self.assertNotIn(f"-tool_timeout_sec = {install_agents.MCP_TOOL_TIMEOUT_SEC}", preview)
+        self.assertIn(
+            f"tool_timeout_sec = {install_agents.MCP_TOOL_TIMEOUT_SEC}",
+            (self.home / "config.toml").read_text(encoding="utf-8"),
+        )
+
+    def test_non_hooks_mcp_drift_blocks_uninstall_atomically(self):
+        errors, _ = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0)
+        config_path = self.home / "config.toml"
+        drifted = config_path.read_text(encoding="utf-8").replace(
+            install_agents.MCP_END,
+            "unexpected_setting = true\n" + install_agents.MCP_END,
+            1,
+        )
+        config_path.write_text(drifted, encoding="utf-8")
+        runtime = self.home / install_agents.RUNTIME_SUBDIR
+        manifest_path = self.home / "smart-router" / "installed.json"
+        manifest_before = manifest_path.read_bytes()
+        errors, messages = install_agents.uninstall(self.home)
+        self.assertGreater(errors, 0)
+        self.assertTrue(any("CONFIG PRESERVE" in message for message in messages))
+        self.assertEqual(config_path.read_text(encoding="utf-8"), drifted)
+        self.assertEqual(len(list((self.home / "agents").glob("router_*.toml"))), 6)
+        self.assertTrue(runtime.is_symlink())
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+
+    def test_uninstall_preflight_and_apply_preserve_codex_hooks_state(self):
+        errors, _ = install_agents.install(self.home, apply=True)
+        self.assertEqual(errors, 0)
+        hooks = self._inject_codex_hooks_state_into_mcp_block()
+        manifest = install_agents.load_manifest(self.home / "smart-router" / "installed.json")
+        errors, messages = install_agents.check_uninstall_config(self.home, manifest)
+        self.assertEqual(errors, 0, messages)
+        errors, messages = install_agents.uninstall(self.home)
+        self.assertEqual(errors, 0, messages)
+        config = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn(hooks.strip(), config)
+        self.assertNotIn(install_agents.MCP_BEGIN, config)
+        self.assertNotIn(install_agents.CONFIG_BEGIN, config)
 
     def test_existing_agents_section_is_extended_without_duplication(self):
         self.home.mkdir(parents=True)

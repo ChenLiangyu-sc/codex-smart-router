@@ -36,3 +36,5 @@ v0.4.1 针对 GLM 官方端点与 MAAS 中转不保证 OpenAI strict Structured 
 2026-08-26 13:29–13:51（Asia/Shanghai）对官方 `https://open.bigmodel.cn/api/v1/responses` 做了多次真实 GLM-5.3 Max reviewer 回归。首轮 57 秒内一次完成；中间一轮真实暴露了非标准 coverage 形态并按共享 deadline 回退 Terra，随后 adapter 增加保守的 mode/计数规范化；最终候选在 47 秒内由 `glm_reviewer` 一次完成，canonical receipt v2 校验通过，`receipt_mode=json_object_adapter`，只发生 `status_alias/findings_objects/evidence_objects` 的无模型规范化，没有 Terra fallback。内网 MAAS 端点从当前外网机器不可达，须按 [内网 GLM 接入](INNER_NETWORK_GLM.md) 在内网完成相同验收；此项不得伪称已真实通过。
 
 安装 `0.4.1+codex.20260826055427` 并切换 `runtime-current` 后，又从稳定 runtime 入口执行了一次官方 GLM reviewer：106 秒内一次完成，adapter 规范化 status、扁平 findings/inconsistencies 和 coverage scope，`receipt_format_error=null`，没有 Terra fallback。该任务同时发现新 schema 在提交前仍是 untracked 文件；发布流程随后必须把它纳入 Git commit，不能只依赖本机 cache。
+
+v0.4.1 安装器补丁恢复同步 MCP 的 `tool_timeout_sec = 1200`，并为 Codex 写入 managed markers 内的 `hooks.state` trusted hashes 增加窄范围兼容解析。回归覆盖：幂等安装与按内网报告冻结的 v0.4.0 已安装配置 fixture 在升级预览中不删除长超时、reinstall/uninstall/check-uninstall 保留合法 hook 状态、非 hooks 漂移仍 fail closed 且阻断整套卸载，以及 GLM 与 DeepSeek 同时配置时两个 API key 均进入子进程 shell 排除列表。

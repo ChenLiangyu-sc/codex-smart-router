@@ -20,6 +20,8 @@ receipt v2 的字段集合、数组数量和所有文本长度均有界，额外
 
 v0.4.1 把结构化输出能力放入 `ExecutorSpec.receipt_mode`：OpenAI executor 使用 `strict_json_schema`；GLM 官方端点和 GLM MAAS 都使用 `json_object_adapter`。GLM 收到较浅的 `receipt-wire.schema.json`，主进程只做有界、可审计的确定性转换：状态别名、`coverage.scope → mode`、扁平标量对象数组、manifest 的 null path，以及运行时 `schema_version/objective_id`。嵌套对象、非有限数、超限数组和非法哈希不会被猜测修复。最终结果仍须通过 canonical receipt v2 schema。
 
+安装器为同步 `smart_router` MCP 固定写入 `tool_timeout_sec = 1200`，使长任务在 wrapper 的共享 deadline 内完成后仍能唤醒主 Agent。升级和卸载继续按 manifest 精确验证受管 TOML；唯一兼容例外是 Codex 自动插入到 MCP markers 内的严格 `[hooks.state]` / `trusted_hash = "sha256:..."` 表。安装器会保留并移出这段状态，其他任何受管区漂移仍然 fail closed。
+
 adapter 要求明确 status，且至少有一项 summary、action、finding、evidence、validation、risk 或 manifest；`{}`、仅 status、嵌套对象和其他无法安全转换的输出都会被拒绝。wrapper 不再把不可信 child raw 文本交给第二个模型做格式修复。只读任务直接在剩余 deadline 内回退 Terra；格式问题说明 capability/contract 不匹配，不会打开 GLM provider-health circuit，HTTP、鉴权、配额、断连和真实 timeout 才会。primary 与 fallback 共享调用开始时建立的一个 end-to-end deadline，fallback 不能重置完整 timeout。
 
 `PreToolUse` 对本插件的 `router_*` agent 和 wrapper 工具做二次检查：OFF/SHADOW 禁止路由，ON 时要求角色与当前判断一致。可写角色还必须有本轮分类产生的 `write_authorized=true`；该授权只接受与角色相符、未被否定的正向写操作，并拒绝显式只读和高风险任务。wrapper 在子进程入口再次执行同一授权检查，避免主任务与下发任务不一致时扩大权限。

@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -23,6 +24,7 @@ CONFIG_BEGIN = "# BEGIN codex-smart-router"
 CONFIG_END = "# END codex-smart-router"
 MCP_BEGIN = "# BEGIN codex-smart-router-mcp"
 MCP_END = "# END codex-smart-router-mcp"
+MCP_TOOL_TIMEOUT_SEC = 1200
 RUNTIME_SUBDIR = Path("smart-router") / "runtime-current"
 RUNTIME_RELEASES_SUBDIR = Path("smart-router") / "runtime-releases"
 LEGACY_RUNTIME_SUBDIR = Path("smart-router") / "runtime"
@@ -181,14 +183,76 @@ def plan_mcp_config(text: str, codex_home: Path) -> tuple[str, str]:
     server = str(codex_home / RUNTIME_SUBDIR / "scripts" / "router_mcp.py")
     fragment = (
         f"{prefix}\n{MCP_BEGIN}\n[mcp_servers.smart_router]\ncommand = \"python3\"\n"
-        f"args = [{json.dumps(server)}]\n{MCP_END}\n"
+        f"args = [{json.dumps(server)}]\ntool_timeout_sec = {MCP_TOOL_TIMEOUT_SEC}\n{MCP_END}\n"
     )
     return text + fragment, fragment
 
 
-def re_search_setting(section: str, key: str) -> str | None:
-    import re
+def _valid_codex_hooks_state(fragment: str) -> bool:
+    """Accept only the narrow hooks.state shape Codex writes into config.toml."""
+    lines = fragment.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[0].strip() != "[hooks.state]":
+        return False
+    index = 1
+    entry_count = 0
+    table_pattern = re.compile(r'^\[hooks\.state\."(?:[^"\\]|\\.)+"\]$')
+    hash_pattern = re.compile(r'^trusted_hash\s*=\s*"sha256:[0-9a-fA-F]{64}"$')
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
+            continue
+        if not table_pattern.fullmatch(lines[index].strip()):
+            return False
+        index += 1
+        if index >= len(lines) or not hash_pattern.fullmatch(lines[index].strip()):
+            return False
+        entry_count += 1
+        index += 1
+    return entry_count > 0
 
+
+def remove_managed_mcp_config(text: str, expected_fragment: str) -> str:
+    """Remove our MCP block while preserving Codex-inserted hooks.state tables.
+
+    Codex may append its trusted hook hashes immediately before our end marker.
+    Every router-owned byte must still match the manifest; the sole tolerated
+    insertion is the deterministic hooks.state form validated above.
+    """
+    if text.count(MCP_BEGIN) != 1 or text.count(MCP_END) != 1:
+        raise ValueError("managed MCP markers missing or duplicated")
+    if expected_fragment.count(MCP_BEGIN) != 1 or expected_fragment.count(MCP_END) != 1:
+        raise ValueError("invalid managed MCP fragment in installer state")
+    if text.count(expected_fragment) == 1:
+        return text.replace(expected_fragment, "", 1)
+
+    expected_end = expected_fragment.index(MCP_END)
+    expected_prefix = expected_fragment[:expected_end]
+    expected_suffix = expected_fragment[expected_end + len(MCP_END) :]
+    actual_begin = text.index(MCP_BEGIN)
+    leading = expected_fragment[: expected_fragment.index(MCP_BEGIN)]
+    actual_start = actual_begin - len(leading)
+    if actual_start < 0 or text[actual_start:actual_begin] != leading:
+        raise ValueError("managed MCP fragment prefix was modified")
+    actual_end_marker = text.index(MCP_END, actual_begin)
+    actual_end = actual_end_marker + len(MCP_END)
+    if not text.startswith(expected_suffix, actual_end):
+        raise ValueError("managed MCP fragment suffix was modified")
+    actual_end += len(expected_suffix)
+    actual_block = text[actual_start:actual_end]
+    if not actual_block.startswith(expected_prefix) or not actual_block.endswith(MCP_END + expected_suffix):
+        raise ValueError("managed MCP fragment was modified")
+    inserted_end = len(actual_block) - len(MCP_END + expected_suffix)
+    inserted = actual_block[len(expected_prefix) : inserted_end]
+    if not _valid_codex_hooks_state(inserted):
+        raise ValueError("managed MCP fragment contains non-hooks drift")
+    return text[:actual_start] + inserted + text[actual_end:]
+
+
+def re_search_setting(section: str, key: str) -> str | None:
     match = re.search(rf"^\s*{re.escape(key)}\s*=\s*([^#\n]+)", section, re.M)
     return match.group(1).strip().lower() if match else None
 
@@ -207,10 +271,10 @@ def install_config(codex_home: Path, apply: bool, manifest: dict[str, Any]) -> t
             return 1, [f"CONFIG_CONFLICT {config}: previously managed fragment was modified; left untouched"]
         working = working.replace(old_fragment, "", 1)
     if isinstance(previous, dict) and previous.get("mcp_fragment"):
-        old_mcp = previous["mcp_fragment"]
-        if working.count(old_mcp) != 1:
+        try:
+            working = remove_managed_mcp_config(working, previous["mcp_fragment"])
+        except ValueError:
             return 1, [f"CONFIG_CONFLICT {config}: previously managed MCP fragment was modified; left untouched"]
-        working = working.replace(old_mcp, "", 1)
     try:
         updated, fragment, disposition = plan_config(working, codex_home)
         updated, mcp_fragment = plan_mcp_config(updated, codex_home)
@@ -267,15 +331,15 @@ def uninstall_config(codex_home: Path, manifest: dict[str, Any]) -> tuple[int, l
     except FileNotFoundError:
         manifest.pop("config", None)
         return 0, ["CONFIG FORGET: config file already absent"]
-    fragments = [entry["managed_fragment"]]
+    managed_fragment = entry["managed_fragment"]
+    if text.count(managed_fragment) != 1:
+        return 1, [f"CONFIG PRESERVE {config}: managed fragment missing or modified"]
+    updated = text.replace(managed_fragment, "", 1)
     if entry.get("mcp_fragment"):
-        fragments.append(entry["mcp_fragment"])
-    for fragment in fragments:
-        if text.count(fragment) != 1:
+        try:
+            updated = remove_managed_mcp_config(updated, entry["mcp_fragment"])
+        except ValueError:
             return 1, [f"CONFIG PRESERVE {config}: managed fragment missing or modified"]
-    updated = text
-    for fragment in fragments:
-        updated = updated.replace(fragment, "", 1)
     fd, tmp_name = tempfile.mkstemp(prefix=".config.toml.", dir=config.parent)
     try:
         os.fchmod(fd, 0o600)
@@ -304,11 +368,14 @@ def check_uninstall_config(codex_home: Path, manifest: dict[str, Any]) -> tuple[
         text = config.read_text(encoding="utf-8")
     except FileNotFoundError:
         return 0, []
-    fragments = [entry["managed_fragment"]]
-    if entry.get("mcp_fragment"):
-        fragments.append(entry["mcp_fragment"])
-    if any(text.count(fragment) != 1 for fragment in fragments):
+    managed_fragment = entry["managed_fragment"]
+    if text.count(managed_fragment) != 1:
         return 1, [f"CONFIG PRESERVE {config}: managed fragment missing or modified"]
+    if entry.get("mcp_fragment"):
+        try:
+            remove_managed_mcp_config(text.replace(managed_fragment, "", 1), entry["mcp_fragment"])
+        except ValueError:
+            return 1, [f"CONFIG PRESERVE {config}: managed fragment missing or modified"]
     return 0, []
 
 

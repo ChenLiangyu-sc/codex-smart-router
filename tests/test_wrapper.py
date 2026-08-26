@@ -568,13 +568,35 @@ class WrapperTests(unittest.TestCase):
         self.assertNotIn("test-key", " ".join(calls[0]))
 
     def test_child_shell_filter_excludes_glm_key(self):
-        command = run_agent.build_command(
-            "router_reviewer",
-            Path("receipt.json"),
-            provider_policy.EXECUTORS["glm_reviewer"],
+        with tempfile.TemporaryDirectory() as tmp:
+            command = run_agent.build_command(
+                "router_reviewer",
+                Path("receipt.json"),
+                provider_policy.EXECUTORS["glm_reviewer"],
+                home=tmp,
+            )
+        exclude_entry = next(
+            value for value in command if value.startswith("shell_environment_policy.exclude=")
         )
-        self.assertIn('shell_environment_policy.exclude=["^ZHIPU_API_KEY$"]', command)
+        excluded = json.loads(exclude_entry.split("=", 1)[1])
+        self.assertIn("^ZHIPU_API_KEY$", excluded)
         self.assertNotIn("any-real-secret", " ".join(command))
+
+    def test_child_shell_filter_excludes_glm_and_deepseek_keys_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp, env_key="DEEPSEEK_FLASH_API_KEY")
+            command = run_agent.build_command(
+                "router_reviewer",
+                Path("receipt.json"),
+                provider_policy.EXECUTORS["glm_reviewer"],
+                home=tmp,
+            )
+        exclude_entry = next(
+            value for value in command if value.startswith("shell_environment_policy.exclude=")
+        )
+        excluded = json.loads(exclude_entry.split("=", 1)[1])
+        self.assertIn("^ZHIPU_API_KEY$", excluded)
+        self.assertIn("^DEEPSEEK_FLASH_API_KEY$", excluded)
 
     def test_partial_environment_override_preserves_runtime_path(self):
         environment, key = run_agent._child_env(
