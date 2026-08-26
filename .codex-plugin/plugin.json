@@ -1,6 +1,6 @@
 {
   "name": "codex-smart-router",
-  "version": "0.4.0+codex.20260826040335",
+  "version": "0.4.1+codex.20260826055427",
   "description": "Session-scoped routing from GPT-5.6 Sol to GLM-5.3, Terra, Luna, and an optional text-only provider.",
   "author": {
     "name": "chenliangyu"

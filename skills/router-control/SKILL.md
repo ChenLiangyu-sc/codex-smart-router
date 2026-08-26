@@ -25,6 +25,8 @@ description: "显式控制当前 Codex 会话中的 Sol/GLM/Terra/Luna/本地文
 
 v0.4 每个用户目标默认只允许一次委派。路由角色必须通过同步 `smart_router.route_task` 执行，禁止原生 spawn；等待类任务使用一次 `smart_router.wait_for_condition`，不得让模型轮询。已有合格 receipt 时，只验收其中的 `parent_verification`、异常和少量抽样，不重新读取全部覆盖材料。
 
+v0.4.1 中 GLM receipt 由 wrapper 的无模型 `json_object_adapter` 规范化；不要把 `glm_receipt_format_failure` 表述成 GLM 服务宕机，也不要因此建议用户重置 provider 熔断。GLM 与 Terra fallback 共用同一个总 timeout；不得追加一个模型格式修复步骤。
+
 GLM 凭据未配置时，提示用户在插件目录运行 `python3 scripts/configure_glm.py`；不得在对话、项目文件、agent TOML 或遥测中收集/回显 Key。图片委派只传递任务真正需要的本地图片路径；纯文本 PDF 先提取文本，视觉 PDF 先转成需要的页面图像。
 
 本地文本 provider 未配置时，提示用户运行 `python3 scripts/configure_local_provider.py --help`；若用户正在用 GLM 模拟 DeepSeek 路径，则使用 `--glm-surrogate`。必须称其为 surrogate，不得把测试结果表述为 DeepSeek 的真实性能或兼容性结论。

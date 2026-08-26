@@ -6,15 +6,17 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from local_provider import (
@@ -39,6 +41,9 @@ GLM_ENV_KEY = "ZHIPU_API_KEY"
 GLM_PROVIDER_ID = "zhipu_glm_coding"
 GLM_BASE_URL = "https://open.bigmodel.cn/api/v1"
 GLM_MODEL = "glm-5.3"
+
+RECEIPT_STRICT_JSON_SCHEMA = "strict_json_schema"
+RECEIPT_JSON_OBJECT_ADAPTER = "json_object_adapter"
 
 LUNA_ROLES = {"router_scout", "router_monitor", "router_tester", "router_docs"}
 LOCAL_TEXT_ELIGIBLE_ROLES = {"router_scout", "router_monitor"}
@@ -66,6 +71,7 @@ class ExecutorSpec:
     wire_api: str = "responses"
     model_catalog: str | None = None
     provider_fingerprint: str | None = None
+    receipt_mode: str = RECEIPT_STRICT_JSON_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -90,10 +96,12 @@ EXECUTORS = {
     "glm_worker": ExecutorSpec(
         "glm_worker", GLM_PROVIDER_ID, GLM_MODEL, "max", "workspace-write", "GLM-5.3 Max · 执行",
         "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+        receipt_mode=RECEIPT_JSON_OBJECT_ADAPTER,
     ),
     "glm_reviewer": ExecutorSpec(
         "glm_reviewer", GLM_PROVIDER_ID, GLM_MODEL, "max", "read-only", "GLM-5.3 Max · 审查",
         "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+        receipt_mode=RECEIPT_JSON_OBJECT_ADAPTER,
     ),
 }
 
@@ -112,6 +120,8 @@ DEFAULT_POLICY: dict[str, Any] = {
     "peak_end": "18:00",
     "transient_cooldown_seconds": 120,
     "subscription_cooldown_seconds": 21600,
+    "glm_base_url": GLM_BASE_URL,
+    "allow_insecure_glm_http": False,
 }
 
 
@@ -213,7 +223,39 @@ def load_policy(home: str | Path | None = None) -> dict[str, Any]:
             if type(value) is not int or not 1 <= value <= 7 * 24 * 60 * 60:
                 return {**policy, "invalid": True}
             policy[key] = value
+    if "allow_insecure_glm_http" in custom:
+        if type(custom["allow_insecure_glm_http"]) is not bool:
+            return {**policy, "invalid": True}
+        policy["allow_insecure_glm_http"] = custom["allow_insecure_glm_http"]
+    if "glm_base_url" in custom:
+        base_url = _safe_provider_url(
+            custom["glm_base_url"],
+            bool(policy["allow_insecure_glm_http"]),
+        )
+        if base_url is None:
+            return {**policy, "invalid": True}
+        policy["glm_base_url"] = base_url
     return policy
+
+
+def _safe_provider_url(value: Any, allow_insecure_http: bool) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 2048 or any(ord(char) < 32 for char in value):
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return None
+    if parsed.scheme == "http":
+        local_host = parsed.hostname.lower() == "localhost"
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+            local_host = address.is_private or address.is_loopback or address.is_link_local
+        except ValueError:
+            pass
+        if not local_host and not allow_insecure_http:
+            return None
+    return value.rstrip("/")
 
 
 def _clock_time(value: str) -> dt.time:
@@ -278,6 +320,12 @@ def key_fingerprint(value: str | None) -> str | None:
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16] if value else None
 
 
+def glm_health_identity(key: str | None, base_url: str | None = None) -> str | None:
+    if not key:
+        return None
+    return f"{key}\0{(base_url or GLM_BASE_URL).rstrip('/')}"
+
+
 def _load_health_unlocked(home: str | Path | None = None) -> dict[str, Any]:
     try:
         value = json.loads(health_path(home).read_text(encoding="utf-8"))
@@ -293,9 +341,10 @@ def glm_health_available(
     key: str | None,
     now_epoch: int | None = None,
     home: str | Path | None = None,
+    base_url: str | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     now_value = int(time.time()) if now_epoch is None else int(now_epoch)
-    fingerprint = key_fingerprint(key)
+    fingerprint = key_fingerprint(glm_health_identity(key, base_url))
     with _health_lock(home):
         state = _load_health_unlocked(home)
         if state.get("state") == "closed":
@@ -398,6 +447,7 @@ def record_glm_failure(
     home: str | Path | None = None,
     now_epoch: int | None = None,
     policy: Mapping[str, Any] | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     now_value = int(time.time()) if now_epoch is None else int(now_epoch)
     active = dict(policy or load_policy(home))
@@ -442,7 +492,7 @@ def record_glm_failure(
         "reason": reason,
         "error_code": code,
         "retry_after": retry_after,
-        "key_fingerprint": key_fingerprint(key),
+            "key_fingerprint": key_fingerprint(glm_health_identity(key, base_url)),
         "updated_at": now_value,
     }
     with _health_lock(home):
@@ -552,11 +602,17 @@ def resolve_executor(
         return Resolution(terra, normalized, "invalid_policy", False, requested_light_profile=normalized_light)
     if is_peak_window(now, policy):
         return Resolution(terra, normalized, "glm_peak_window", False, requested_light_profile=normalized_light)
+    glm = replace(glm, base_url=str(policy["glm_base_url"]))
     key = glm_key(env, home)
     if not key:
         return Resolution(terra, normalized, "glm_key_missing", False, requested_light_profile=normalized_light)
     epoch = int(local_now(policy, now).timestamp()) if now is not None else int(time.time())
-    available, reason, health = glm_health_available(key, epoch, home)
+    available, reason, health = glm_health_available(
+        key,
+        epoch,
+        home,
+        base_url=str(policy["glm_base_url"]),
+    )
     if not available:
         return Resolution(terra, normalized, f"glm_{reason}", False, requested_light_profile=normalized_light)
     return Resolution(

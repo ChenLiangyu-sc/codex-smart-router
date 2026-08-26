@@ -9,7 +9,7 @@ python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/router-control
 ```
 
-测试覆盖路由分类、经济性门、原子单目标唯一委派槽、一次性 runtime lease 与 task digest 绑定、外部 agent 去重、原生 router agent 全面拒绝、确定性长等待/取消/超时、receipt v2/objective 绑定与严格限界、token/耗时台账，以及既有的写授权、高风险拒绝、profile、熔断、多模态、写租约、稳定 runtime、安装/卸载和密钥隔离行为。
+测试覆盖路由分类、经济性门、原子单目标唯一委派槽、一次性 runtime lease 与 task digest 绑定、外部 agent 去重、原生 router agent 全面拒绝、确定性长等待/取消/超时、receipt v2/objective 绑定与严格限界、GLM wire adapter、格式/运行时故障分类、共享 deadline、token/耗时台账，以及既有的写授权、高风险拒绝、profile、熔断、多模态、写租约、稳定 runtime、安装/卸载和密钥隔离行为。
 
 真实 Codex 冒烟建议在非高峰依次验证：环境就绪的新会话在 OFF 时无路由提示；`glm 开启` 后重 profile 为 `GLM_FIRST`；`local 开启` 后轻 profile 为 `LOCAL_TEXT_FIRST`；只读盘点通过本地文本 provider；故障时改用 Luna；tester/docs 仍用 Luna；纯文本审查调用 GLM-5.3 Max；带图片审查调用 Terra；模拟高峰选择 Terra；生产数据库迁移保留 Sol；受控临时仓库中的 worker 只改指定文件；SHADOW 不委派；关闭后不再注入路由指令。receipt 的 `_router_meta` 是实际模型/provider/effort、两套 requested profile 与 fallback 的验收证据。
 
@@ -28,3 +28,11 @@ v0.4.0 在四类真实路径上完成了回归：Luna scout 对 `jd-resume-optim
 最终候选版本的自动化套件包含 134 项测试，其中包括 MCP 子进程级取消测试，验证长等待期间主循环仍能接收 `notifications/cancelled`，且成功、超时、取消路径模型 token 均为零。两名独立 subagent reviewer 在最终修复后再次检查运行时并发/等待路径和策略/文档一致性，结论记录在发布交接中。
 
 仍未真实覆盖：正式 DeepSeek V4 Flash 内网 endpoint、Terra 图片输入、工作日 14:00–18:00 的自然时钟真实高峰切换，以及持续数十分钟的生产进程等待。高峰逻辑、Responses 端点约束、长等待超时与取消已经由确定性测试覆盖，但不能替代上述真实环境验收。
+
+### v0.4.1 回归记录
+
+v0.4.1 针对 GLM 官方端点与 MAAS 中转不保证 OpenAI strict Structured Outputs 的现实增加 provider capability adapter。自动化套件覆盖用户报告的 `pass → completed`、扁平 object array、`coverage.scope → mode`、manifest null path、嵌套/空/status-only 回执拒绝、格式故障不打开熔断、writer 不启动第二写者，以及 GLM/Terra 共用一个 deadline。review 后删除了模型格式重试，避免把不可信 raw receipt 送入仍具工具能力的第二个 Codex 子进程。
+
+2026-08-26 13:29–13:51（Asia/Shanghai）对官方 `https://open.bigmodel.cn/api/v1/responses` 做了多次真实 GLM-5.3 Max reviewer 回归。首轮 57 秒内一次完成；中间一轮真实暴露了非标准 coverage 形态并按共享 deadline 回退 Terra，随后 adapter 增加保守的 mode/计数规范化；最终候选在 47 秒内由 `glm_reviewer` 一次完成，canonical receipt v2 校验通过，`receipt_mode=json_object_adapter`，只发生 `status_alias/findings_objects/evidence_objects` 的无模型规范化，没有 Terra fallback。内网 MAAS 端点从当前外网机器不可达，须按 [内网 GLM 接入](INNER_NETWORK_GLM.md) 在内网完成相同验收；此项不得伪称已真实通过。
+
+安装 `0.4.1+codex.20260826055427` 并切换 `runtime-current` 后，又从稳定 runtime 入口执行了一次官方 GLM reviewer：106 秒内一次完成，adapter 规范化 status、扁平 findings/inconsistencies 和 coverage scope，`receipt_format_error=null`，没有 Terra fallback。该任务同时发现新 schema 在提交前仍是 untracked 文件；发布流程随后必须把它纳入 Git commit，不能只依赖本机 cache。

@@ -325,6 +325,70 @@ class ProviderPolicyTests(unittest.TestCase):
             self.assertEqual(policy["peak_weekdays"], [6])
             self.assertEqual(policy["peak_start"], "12:00")
 
+    def test_policy_can_select_an_explicit_internal_glm_gateway(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = provider_policy.policy_path(tmp)
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "glm_base_url": "http://maas.msxf.msxfyun.test/v1/",
+                        "allow_insecure_glm_http": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = provider_policy.resolve_executor(
+                "router_reviewer",
+                "GLM_FIRST",
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=TZ),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                home=tmp,
+            )
+        self.assertEqual(result.executor.base_url, "http://maas.msxf.msxfyun.test/v1")
+        self.assertEqual(result.executor.receipt_mode, provider_policy.RECEIPT_JSON_OBJECT_ADAPTER)
+
+    def test_glm_endpoint_change_resets_an_open_health_circuit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider_policy.record_glm_failure(
+                '{"code":1317}',
+                "test-key",
+                tmp,
+                now_epoch=100,
+                base_url=provider_policy.GLM_BASE_URL,
+            )
+            available, reason, _ = provider_policy.glm_health_available(
+                "test-key",
+                101,
+                tmp,
+                base_url="https://maas.example.test/v1",
+            )
+        self.assertTrue(available)
+        self.assertEqual(reason, "key_changed")
+
+    def test_internal_glm_gateway_failure_remains_open_for_same_endpoint(self):
+        gateway = "https://maas.example.test/v1"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = provider_policy.policy_path(tmp)
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"glm_base_url": gateway}), encoding="utf-8")
+            provider_policy.record_glm_failure(
+                '{"code":1317}',
+                "test-key",
+                tmp,
+                now_epoch=100,
+                base_url=gateway,
+            )
+            result = provider_policy.resolve_executor(
+                "router_reviewer",
+                "GLM_FIRST",
+                now=dt.datetime.fromtimestamp(101, tz=TZ),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                home=tmp,
+            )
+        self.assertEqual(result.executor.model, "gpt-5.6-terra")
+        self.assertEqual(result.reason, "glm_quota_7d")
+
     def test_invalid_policy_fields_fail_closed(self):
         invalid_values = (
             {"timezone": "Mars/Olympus"},
@@ -332,6 +396,9 @@ class ProviderPolicyTests(unittest.TestCase):
             {"peak_weekdays": [True]},
             {"peak_start": "18:00", "peak_end": "14:00"},
             {"transient_cooldown_seconds": 0},
+            {"glm_base_url": "http://maas.msxf.msxfyun.test/v1"},
+            {"glm_base_url": "https://user:secret@example.com/v1"},
+            {"allow_insecure_glm_http": "yes"},
             {"unknown_field": 1},
         )
         for index, value in enumerate(invalid_values):

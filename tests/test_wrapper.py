@@ -211,7 +211,7 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaisesRegex(run_agent.ChildFailure, "different objective_id"):
                 run_agent.run_task("router_scout", "搜索仓库", objective_id="1" * 64)
 
-    def test_glm_objective_mismatch_falls_back_before_success_recording(self):
+    def test_glm_objective_id_is_runtime_bound_without_fallback(self):
         expected = "1" * 64
 
         def fake_invoke(role, task, executor, workspace, timeout, images, env, home, objective_id):
@@ -238,10 +238,12 @@ class WrapperTests(unittest.TestCase):
                 codex_home=tmp,
                 objective_id=expected,
             )
-        success.assert_not_called()
-        failure.assert_called_once()
-        self.assertEqual(receipt["_router_meta"]["executor"], "terra_reviewer")
-        self.assertEqual(receipt["_router_meta"]["usage"]["input_tokens"], 6)
+        success.assert_called_once()
+        failure.assert_not_called()
+        self.assertEqual(receipt["objective_id"], expected)
+        self.assertEqual(receipt["_router_meta"]["executor"], "glm_reviewer")
+        self.assertEqual(receipt["_router_meta"]["usage"]["input_tokens"], 3)
+        self.assertIn("objective_id_runtime_override", receipt["_router_meta"]["receipt_normalizations"])
 
     def test_local_objective_mismatch_falls_back_before_success_recording(self):
         expected = "2" * 64
@@ -269,10 +271,166 @@ class WrapperTests(unittest.TestCase):
                     codex_home=tmp,
                     objective_id=expected,
                 )
-        success.assert_not_called()
-        failure.assert_called_once()
+        success.assert_called_once()
+        failure.assert_not_called()
         self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_receipt_format_failure")
         self.assertEqual(receipt["_router_meta"]["usage"]["input_tokens"], 4)
+
+    def test_glm_wire_adapter_handles_observed_maas_variants(self):
+        raw = json.dumps(
+            {
+                "status": "pass",
+                "summary": "arithmetic checked",
+                "findings": [{"severity": "info", "message": "2 + 2 = 4"}],
+                "evidence": [],
+                "evidence_manifest": [
+                    {"claim": "direct evaluation", "path": None, "locator": "prompt", "sha256": None}
+                ],
+                "validation": [{"kind": "arithmetic", "detail": "evaluated directly"}],
+                "coverage": {"scope": "full", "checked": 1, "total": 1},
+                "parent_verification": [{"check": "Re-evaluate independently"}],
+                "changed_files": [],
+                "remaining_risks": [],
+                "needs_escalation": False,
+                "recommended_next_action": "accept",
+            }
+        )
+        adapted, normalizations = run_agent.adapt_json_object_receipt(raw, "a" * 64)
+        valid, errors, receipt = run_agent.validate_receipt(adapted)
+        self.assertTrue(valid, errors)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["coverage"]["mode"], "full")
+        self.assertEqual(receipt["evidence_manifest"][0]["path"], "")
+        self.assertIn("findings_objects", normalizations)
+        self.assertIn("validation_objects", normalizations)
+        self.assertIn("coverage_scope_alias", normalizations)
+        self.assertIn("evidence_manifest_null_path", normalizations)
+
+    def test_glm_wire_adapter_rejects_nested_semantic_objects(self):
+        raw = json.dumps({"status": "pass", "findings": [{"message": {"nested": True}}]})
+        with self.assertRaises(run_agent.ReceiptFormatFailure):
+            run_agent.adapt_json_object_receipt(raw, "a" * 64)
+
+    def test_glm_wire_adapter_rejects_empty_or_status_only_receipts(self):
+        for value in ({}, {"status": "pass"}):
+            with self.subTest(value=value), self.assertRaises(run_agent.ReceiptFormatFailure):
+                run_agent.adapt_json_object_receipt(json.dumps(value), "a" * 64)
+
+    def test_glm_wire_adapter_conservatively_normalizes_coverage_shapes(self):
+        base = {
+            "status": "pass",
+            "findings": ["checked"],
+            "coverage": {
+                "scope": "targeted_files",
+                "files_checked": ["a.py", "b.py"],
+                "files_total": "3",
+            },
+        }
+        adapted, normalizations = run_agent.adapt_json_object_receipt(json.dumps(base), "a" * 64)
+        _, _, receipt = run_agent.validate_receipt(adapted)
+        self.assertEqual(receipt["coverage"], {"mode": "targeted", "checked": 2, "total": 3})
+        self.assertIn("coverage_mode_conservative", normalizations)
+        self.assertIn("coverage_checked_list_count", normalizations)
+        self.assertIn("coverage_total_numeric_string", normalizations)
+
+    def test_glm_wire_adapter_never_infers_full_or_unbounded_coverage(self):
+        base = {
+            "status": "pass",
+            "findings": ["checked"],
+            "coverage": {
+                "mode": "sampled_not_full",
+                "checked": "9" * 5000,
+                "total": [{"nested": "not countable"}],
+            },
+        }
+        adapted, normalizations = run_agent.adapt_json_object_receipt(json.dumps(base), "a" * 64)
+        _, _, receipt = run_agent.validate_receipt(adapted)
+        self.assertEqual(receipt["coverage"], {"mode": "targeted", "checked": 0, "total": None})
+        self.assertIn("coverage_mode_conservative", normalizations)
+        self.assertIn("coverage_checked_conservative", normalizations)
+        self.assertIn("coverage_total_conservative", normalizations)
+        huge_total = {**base, "coverage": {"mode": "not_full", "checked": 1, "total": 10_000_000}}
+        adapted, _ = run_agent.adapt_json_object_receipt(json.dumps(huge_total), "a" * 64)
+        _, _, receipt = run_agent.validate_receipt(adapted)
+        self.assertEqual(receipt["coverage"], {"mode": "targeted", "checked": 1, "total": None})
+
+    def test_glm_format_failure_does_not_open_health_circuit(self):
+        calls = []
+
+        def fake_invoke(role, task, executor, workspace, timeout, images, env, home, objective_id):
+            calls.append(executor.id)
+            if executor.provider == provider_policy.GLM_PROVIDER_ID:
+                return "not-json", None, {"input_tokens": 3, "cached_input_tokens": 0, "output_tokens": 1}, 5
+            receipt = valid_receipt()
+            receipt["objective_id"] = objective_id
+            return json.dumps(receipt), None, {"input_tokens": 2, "cached_input_tokens": 0, "output_tokens": 1}, 4
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "run_agent._invoke", side_effect=fake_invoke
+        ), mock.patch("run_agent.record_glm_failure") as failure:
+            receipt = run_agent.run_task(
+                "router_reviewer",
+                "审查当前仓库多个模块",
+                execution_profile="GLM_FIRST",
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                codex_home=tmp,
+            )
+        failure.assert_not_called()
+        self.assertEqual(calls, ["glm_reviewer", "terra_reviewer"])
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_reviewer")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "glm_receipt_format_failure")
+
+    def test_glm_format_failure_and_fallback_share_one_deadline(self):
+        timeouts = []
+
+        def fake_invoke(role, task, executor, workspace, timeout, images, env, home, objective_id):
+            timeouts.append(timeout)
+            if executor.provider == provider_policy.GLM_PROVIDER_ID:
+                return "not-json", None, {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}, 1
+            receipt = valid_receipt()
+            receipt["objective_id"] = objective_id
+            return json.dumps(receipt), None, {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}, 1
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "run_agent.time.monotonic", side_effect=[100.0, 101.0, 105.0]
+        ), mock.patch("run_agent._invoke", side_effect=fake_invoke), mock.patch(
+            "run_agent.record_glm_failure"
+        ) as failure:
+            receipt = run_agent.run_task(
+                "router_reviewer",
+                "审查当前仓库多个模块",
+                timeout=10,
+                execution_profile="GLM_FIRST",
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                codex_home=tmp,
+            )
+        failure.assert_not_called()
+        self.assertEqual(timeouts, [9, 5])
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "glm_receipt_format_failure")
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["glm_reviewer", "terra_reviewer"])
+
+    def test_glm_writer_receipt_failure_never_starts_a_terra_writer(self):
+        calls = []
+
+        def fake_invoke(role, task, executor, workspace, timeout, images, env, home, objective_id):
+            calls.append(executor.id)
+            return "not-json", None, {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}, 1
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent._invoke", side_effect=fake_invoke):
+            with self.assertRaisesRegex(run_agent.ChildFailure, "automatic writer fallback was suppressed"):
+                run_agent.run_task(
+                    "router_worker",
+                    "实现这个边界清晰的小功能",
+                    execution_profile="GLM_FIRST",
+                    workspace=tmp,
+                    now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    env={provider_policy.GLM_ENV_KEY: "test-key"},
+                    codex_home=tmp,
+                )
+        self.assertEqual(calls, ["glm_worker"])
 
     def test_mcp_tool_schema_excludes_model_monitor(self):
         tool = router_mcp.tool_definition()
@@ -510,7 +668,7 @@ class WrapperTests(unittest.TestCase):
                     codex_home=tmp,
                 )
         self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
-        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_runtime_failure")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_receipt_format_failure")
         self.assertEqual(len(calls), 2)
 
     def test_local_no_auth_provider_is_supported(self):

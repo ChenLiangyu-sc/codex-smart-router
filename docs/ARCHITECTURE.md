@@ -10,13 +10,17 @@ v0.4 把“是否值得委派”与能力分类分开：高风险门先保留 So
 
 `python3 scripts/configure_local_provider.py --glm-surrogate` 生成一个明确标记为 surrogate 的 GLM-5.3 Medium 配置，复用现有 GLM provider 端点和 `ZHIPU_API_KEY` 环境变量名但不复制凭据。它验证的是轻任务路由控制面和 Responses 数据面，不替代 DeepSeek V4 Flash 的质量、吞吐、故障与端点兼容性测试。
 
-GLM 默认策略为 `Asia/Shanghai`、周一至周五、`14:00 <= 当前时间 < 18:00` 使用 Terra；周末仍可使用 GLM。可选的 `~/.codex/smart-router/policy.json` 仅允许覆盖 `timezone`、`peak_weekdays`、`peak_start`、`peak_end`、`transient_cooldown_seconds` 和 `subscription_cooldown_seconds`，非法文件会 fail closed 到 Terra。
+GLM 默认策略为 `Asia/Shanghai`、周一至周五、`14:00 <= 当前时间 < 18:00` 使用 Terra；周末仍可使用 GLM。可选的 `~/.codex/smart-router/policy.json` 允许覆盖 `timezone`、`peak_weekdays`、`peak_start`、`peak_end`、两类 cooldown、`glm_base_url` 和 `allow_insecure_glm_http`，非法文件会 fail closed 到 Terra。官方默认端点是 HTTPS；内网 HTTP hostname 必须同时显式设置 `allow_insecure_glm_http=true`，URL 中的凭据、query 和 fragment 一律拒绝。
 
 provider 凭据从进程环境或权限必须为 `0600` 的 `~/.codex/smart-router/providers.env` 读取。wrapper 通过子进程环境把 Key 交给 Codex provider，但命令参数只有环境变量名；同时按照 Codex 配置使用动态 `shell_environment_policy.exclude` 从 child shell 过滤所有已知 provider Key，并用 `--strict-config` 阻止未知配置静默失效。状态、receipt 和异常信息仅保留 Key 指纹或脱敏文本。
 
 正常且默认关闭的新会话不注入额外上下文。`SessionStart` 只在安装未就绪或恢复一个已开启/影子会话时提供紧凑提示；`SessionStart` 与 `UserPromptSubmit` 均设置 512 token 的附加上下文上限。普通路由契约只携带角色、写权限、调用/回退规则和用户可见结果标签，不重复完整策略。完整规则按需保留在 skill reference 中。
 
-receipt v2 的字段集合、数组数量和所有文本长度均有界，额外字段会被拒绝；findings/evidence 为完整路径和完整句子预留 800 字符。新增 `objective_id`、`coverage`、`evidence_manifest`、`inconsistencies` 和最多三项 `parent_verification`；wrapper 在记录 provider 成功前校验 objective 与当前 decision 一致。主 Agent 把 coverage 当作已覆盖边界，只复核 manifest 哈希、异常、parent_verification 和少量样本。
+receipt v2 的字段集合、数组数量和所有文本长度均有界，额外字段会被拒绝；findings/evidence 为完整路径和完整句子预留 800 字符。新增 `objective_id`、`coverage`、`evidence_manifest`、`inconsistencies` 和最多三项 `parent_verification`。strict provider 必须返回匹配当前 decision 的 objective；GLM 的 objective 由可信 wrapper 在 adapter 阶段绑定，不依赖模型复制。主 Agent 把 coverage 当作已覆盖边界，只复核 manifest 哈希、异常、parent_verification 和少量样本。
+
+v0.4.1 把结构化输出能力放入 `ExecutorSpec.receipt_mode`：OpenAI executor 使用 `strict_json_schema`；GLM 官方端点和 GLM MAAS 都使用 `json_object_adapter`。GLM 收到较浅的 `receipt-wire.schema.json`，主进程只做有界、可审计的确定性转换：状态别名、`coverage.scope → mode`、扁平标量对象数组、manifest 的 null path，以及运行时 `schema_version/objective_id`。嵌套对象、非有限数、超限数组和非法哈希不会被猜测修复。最终结果仍须通过 canonical receipt v2 schema。
+
+adapter 要求明确 status，且至少有一项 summary、action、finding、evidence、validation、risk 或 manifest；`{}`、仅 status、嵌套对象和其他无法安全转换的输出都会被拒绝。wrapper 不再把不可信 child raw 文本交给第二个模型做格式修复。只读任务直接在剩余 deadline 内回退 Terra；格式问题说明 capability/contract 不匹配，不会打开 GLM provider-health circuit，HTTP、鉴权、配额、断连和真实 timeout 才会。primary 与 fallback 共享调用开始时建立的一个 end-to-end deadline，fallback 不能重置完整 timeout。
 
 `PreToolUse` 对本插件的 `router_*` agent 和 wrapper 工具做二次检查：OFF/SHADOW 禁止路由，ON 时要求角色与当前判断一致。可写角色还必须有本轮分类产生的 `write_authorized=true`；该授权只接受与角色相符、未被否定的正向写操作，并拒绝显式只读和高风险任务。wrapper 在子进程入口再次执行同一授权检查，避免主任务与下发任务不一致时扩大权限。
 
@@ -38,7 +42,7 @@ GLM provider 健康状态位于 `~/.codex/smart-router/provider-health.json`，�
 
 本地文本健康状态独立保存在 `local-provider-health.json`。运行或认证失败先打开短熔断，期间 scout 直接走 Luna；配置或 Key 指纹变化会重置熔断，到期后同样只允许一个半开探针。它不修改 GLM 重任务健康状态；GLM surrogate 因共享同一真实上游，只能验证逻辑隔离，无法模拟独立本地硬件故障。
 
-GLM 运行时失败时，只读 reviewer 可安全重试 Terra。worker 只有在 Codex JSON 事件流包含明确终止事件、没有工具活动、Git 前后指纹都成功且未变化时才重试；非 Git 工作区、事件流不完整、指纹失败、超时或检测到变化时都禁止自动启动第二个 writer。这比无条件 fallback 更保守。
+GLM 运行时失败时，只读 reviewer 可安全重试 Terra。worker 只有在 Codex JSON 事件流包含明确终止事件、没有工具活动、Git 前后指纹都成功且未变化时才重试；非 Git 工作区、事件流不完整、指纹失败、超时或检测到变化时都禁止自动启动第二个 writer。GLM writer 已完成但 receipt 无法确定性规范化时同样禁止 Terra writer。
 
 所有 `router_*` 角色都必须通过 MCP wrapper 执行；不再为固定 Luna 角色保留原生旁路。这统一了恢复语义、单委派约束、receipt v2 与 token/耗时台账。安装的 `router_monitor.toml` 仅为旧配置兼容占位，hook 不允许启动它。
 

@@ -26,6 +26,7 @@ from provider_policy import (
     LIGHT_PROFILE_LUNA_STABLE,
     LOCAL_TEXT_ELIGIBLE_ROLES,
     PROFILE_STABLE,
+    RECEIPT_JSON_OBJECT_ADAPTER,
     ExecutorSpec,
     glm_key,
     record_glm_failure,
@@ -51,6 +52,7 @@ from router_core import (
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = PLUGIN_ROOT / "assets" / "receipt.schema.json"
+WIRE_SCHEMA = PLUGIN_ROOT / "assets" / "receipt-wire.schema.json"
 GLM_CATALOG = PLUGIN_ROOT / "assets" / "glm-models.json"
 AGENTS = PLUGIN_ROOT / "install" / "agent-definitions"
 
@@ -66,6 +68,7 @@ ROLE_SETTINGS = {
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NON_TOOL_ITEM_TYPES = {"agent_message", "reasoning", "error", "todo_list"}
+MAX_COVERAGE_COUNT = 1_000_000
 
 
 class ChildFailure(RuntimeError):
@@ -82,6 +85,14 @@ class ChildFailure(RuntimeError):
         self.may_have_mutated = may_have_mutated
         self.usage = usage or {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
         self.duration_ms = max(0, duration_ms)
+
+
+class ReceiptFormatFailure(ChildFailure):
+    """A provider completed, but its output could not become a canonical receipt."""
+
+    def __init__(self, detail: str, *, raw: str = "", may_have_mutated: bool = False) -> None:
+        super().__init__(detail, may_have_mutated=may_have_mutated)
+        self.raw = raw
 
 
 def role_instructions(role: str) -> str:
@@ -199,7 +210,7 @@ def build_command(
     command.extend(
         [
             "--output-schema",
-            str(SCHEMA),
+            str(WIRE_SCHEMA if executor.receipt_mode == RECEIPT_JSON_OBJECT_ADAPTER else SCHEMA),
             "--output-last-message",
             str(output_path),
             "-",
@@ -326,6 +337,222 @@ def _normalize_receipt_text(raw: str) -> tuple[str, list[str]]:
     return json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), allow_nan=False), normalized_fields
 
 
+def _json_object(raw: str) -> dict[str, Any] | None:
+    text = raw.strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+    try:
+        value = json.loads(
+            text,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(f"invalid constant: {item}")),
+        )
+    except (json.JSONDecodeError, ValueError):
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            value = json.loads(
+                text[start : end + 1],
+                parse_constant=lambda item: (_ for _ in ()).throw(ValueError(f"invalid constant: {item}")),
+            )
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def _bounded_string_list(
+    value: Any,
+    *,
+    max_items: int,
+    max_length: int,
+    allow_flat_objects: bool,
+) -> list[str] | None:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > max_items:
+        return None
+    converted: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item
+        elif allow_flat_objects and isinstance(item, dict) and len(item) <= 8 and all(
+            isinstance(key, str)
+            and isinstance(entry, (str, int, float, bool, type(None)))
+            and not (isinstance(entry, float) and not math.isfinite(entry))
+            for key, entry in item.items()
+        ):
+            text = "; ".join(f"{key}={entry}" for key, entry in item.items())
+        else:
+            return None
+        if len(text) > max_length:
+            return None
+        converted.append(text)
+    return converted
+
+
+def adapt_json_object_receipt(raw: str, objective_id: str) -> tuple[str, list[str]]:
+    """Convert a bounded provider JSON object into strict receipt v2 without inventing evidence."""
+    source = _json_object(raw)
+    if source is None or len(source) > 24:
+        raise ReceiptFormatFailure("provider returned no bounded JSON object")
+    normalizations: list[str] = []
+    aliases = {"pass": "completed", "passed": "completed", "success": "completed", "ok": "completed", "error": "failed"}
+    status = source.get("status")
+    if status is None:
+        raise ReceiptFormatFailure("provider receipt omitted status")
+    if isinstance(status, str):
+        mapped = aliases.get(status.lower(), status.lower())
+        if mapped != status:
+            normalizations.append("status_alias")
+        status = mapped
+    if status not in {"completed", "blocked", "failed"}:
+        raise ReceiptFormatFailure("provider receipt has an unsupported status")
+
+    list_limits = {
+        "findings": (6, 800),
+        "evidence": (6, 800),
+        "inconsistencies": (4, 600),
+        "parent_verification": (3, 300),
+        "changed_files": (50, 300),
+        "validation": (6, 600),
+        "remaining_risks": (6, 600),
+    }
+    lists: dict[str, list[str]] = {}
+    for field, (max_items, max_length) in list_limits.items():
+        converted = _bounded_string_list(
+            source.get(field),
+            max_items=max_items,
+            max_length=max_length,
+            allow_flat_objects=field != "changed_files",
+        )
+        if converted is None:
+            raise ReceiptFormatFailure(f"provider receipt field {field} is not safely normalizable")
+        if any(isinstance(item, dict) for item in (source.get(field) or [])):
+            normalizations.append(f"{field}_objects")
+        lists[field] = converted
+
+    coverage_source = source.get("coverage")
+    if coverage_source is None:
+        coverage = {"mode": "targeted", "checked": 0, "total": None}
+        normalizations.append("coverage_default")
+    elif isinstance(coverage_source, dict):
+        mode = coverage_source.get("mode", coverage_source.get("scope"))
+        if "mode" not in coverage_source and "scope" in coverage_source:
+            normalizations.append("coverage_scope_alias")
+        if mode not in {"full", "sample", "targeted"}:
+            normalized_mode = mode.strip().lower() if isinstance(mode, str) else ""
+            mode = normalized_mode if normalized_mode in {"full", "sample", "targeted"} else "targeted"
+            normalizations.append("coverage_mode_conservative")
+        checked = coverage_source.get(
+            "checked",
+            coverage_source.get("items_checked", coverage_source.get("files_checked", 0)),
+        )
+        total = coverage_source.get(
+            "total",
+            coverage_source.get("items_total", coverage_source.get("files_total")),
+        )
+        if isinstance(checked, str) and len(checked) <= 7 and checked.isdigit():
+            checked = int(checked)
+            normalizations.append("coverage_checked_numeric_string")
+        elif (
+            isinstance(checked, list)
+            and len(checked) <= MAX_COVERAGE_COUNT
+            and all(isinstance(item, (str, int)) and not isinstance(item, bool) for item in checked)
+        ):
+            checked = len(checked)
+            normalizations.append("coverage_checked_list_count")
+        if type(checked) is not int or not 0 <= checked <= MAX_COVERAGE_COUNT:
+            checked = 0
+            normalizations.append("coverage_checked_conservative")
+        if isinstance(total, str) and len(total) <= 7 and total.isdigit():
+            total = int(total)
+            normalizations.append("coverage_total_numeric_string")
+        elif (
+            isinstance(total, list)
+            and len(total) <= MAX_COVERAGE_COUNT
+            and all(isinstance(item, (str, int)) and not isinstance(item, bool) for item in total)
+        ):
+            total = len(total)
+            normalizations.append("coverage_total_list_count")
+        if total is not None and (type(total) is not int or not 0 <= total <= MAX_COVERAGE_COUNT):
+            total = None
+            normalizations.append("coverage_total_conservative")
+        if total is not None and total < checked:
+            total = None
+            normalizations.append("coverage_total_inconsistent")
+        coverage = {"mode": mode, "checked": checked, "total": total}
+    else:
+        raise ReceiptFormatFailure("provider receipt coverage is invalid")
+
+    manifest: list[dict[str, Any]] = []
+    manifest_source = source.get("evidence_manifest") or []
+    if not isinstance(manifest_source, list) or len(manifest_source) > 6:
+        raise ReceiptFormatFailure("provider receipt evidence_manifest is invalid")
+    for item in manifest_source:
+        if not isinstance(item, dict) or len(item) > 8:
+            raise ReceiptFormatFailure("provider receipt evidence_manifest item is invalid")
+        path = item.get("path", "")
+        if path is None:
+            path = ""
+            normalizations.append("evidence_manifest_null_path")
+        claim, locator, sha256 = item.get("claim", ""), item.get("locator", ""), item.get("sha256")
+        if not all(isinstance(value, str) for value in (claim, path, locator)):
+            raise ReceiptFormatFailure("provider receipt evidence_manifest text is invalid")
+        if sha256 is not None and (not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256)):
+            raise ReceiptFormatFailure("provider receipt evidence_manifest sha256 is invalid")
+        manifest.append({"claim": claim, "path": path, "locator": locator, "sha256": sha256})
+
+    summary = source.get("summary", "")
+    action = source.get("recommended_next_action", "")
+    escalation = source.get("needs_escalation", status != "completed")
+    if not isinstance(summary, str) or len(summary) > 500 or not isinstance(action, str) or len(action) > 300:
+        raise ReceiptFormatFailure("provider receipt summary or action is invalid")
+    if type(escalation) is not bool:
+        raise ReceiptFormatFailure("provider receipt needs_escalation is invalid")
+    if source.get("objective_id") not in {None, objective_id}:
+        normalizations.append("objective_id_runtime_override")
+    if not (
+        summary.strip()
+        or action.strip()
+        or lists["findings"]
+        or lists["evidence"]
+        or lists["validation"]
+        or lists["remaining_risks"]
+        or manifest
+    ):
+        raise ReceiptFormatFailure("provider receipt contains no substantive result, evidence, validation, or risk")
+    allowed = set(list_limits) | {
+        "schema_version", "objective_id", "status", "summary", "evidence_manifest", "coverage",
+        "needs_escalation", "recommended_next_action",
+    }
+    if set(source) - allowed:
+        normalizations.append("unknown_fields_dropped")
+    receipt = {
+        "schema_version": 2,
+        "objective_id": objective_id,
+        "status": status,
+        "summary": summary,
+        "findings": lists["findings"],
+        "evidence": lists["evidence"],
+        "evidence_manifest": manifest,
+        "inconsistencies": lists["inconsistencies"],
+        "coverage": coverage,
+        "parent_verification": lists["parent_verification"],
+        "changed_files": lists["changed_files"],
+        "validation": lists["validation"],
+        "remaining_risks": lists["remaining_risks"],
+        "needs_escalation": escalation,
+        "recommended_next_action": action,
+    }
+    encoded = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    valid, errors, _ = validate_receipt(encoded)
+    if not valid:
+        raise ReceiptFormatFailure("adapted provider receipt is invalid: " + "; ".join(errors))
+    return encoded, normalizations
+
+
 def _writer_failure_may_have_mutated(
     role: str,
     before: str | None,
@@ -377,14 +604,25 @@ def _invoke(
     home: str | Path | None,
     objective_id: str,
 ) -> tuple[str, str | None, dict[str, int], int]:
+    receipt_instruction = (
+        "Return a compact JSON object. The wrapper, not you, supplies schema_version and objective_id and converts "
+        "this wire object into canonical receipt v2."
+        if executor.receipt_mode == RECEIPT_JSON_OBJECT_ADAPTER
+        else f"Set schema_version to 2 and copy this objective_id exactly: {objective_id}."
+    )
+    objective_instruction = (
+        "" if executor.receipt_mode == RECEIPT_JSON_OBJECT_ADAPTER
+        else f"\n\nReceipt objective_id (copy exactly): {objective_id}"
+    )
     prompt = (
         "You are a bounded Smart Router child process. Follow these role instructions exactly:\n\n"
         + role_instructions(role)
         + "\n\nAssigned task:\n"
         + task
-        + f"\n\nReceipt objective_id (copy exactly): {objective_id}"
+        + objective_instruction
         + "\n\nDo not spawn subagents. Return only the required receipt JSON. Keep summary within two sentences; "
-        "set schema_version to 2; include only decision-relevant evidence and no process narration. Record coverage, "
+        + receipt_instruction
+        + " Include only decision-relevant evidence and no process narration. Record coverage, "
         "inconsistencies, a compact evidence_manifest, and at most three parent_verification checks so the parent can "
         "verify hashes/anomalies/samples without rereading all inputs. Use at most six findings and six evidence "
         "items, at most eight changed_files, and at most six validation/remaining_risks items. Keep each "
@@ -465,6 +703,9 @@ def run_task(
     codex_home: str | Path | None = None,
     objective_id: str | None = None,
 ) -> dict[str, Any]:
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError("timeout must be a positive integer")
+    deadline = time.monotonic() + timeout
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
     profile = execution_profile.upper()
@@ -496,6 +737,7 @@ def run_task(
     )
     attempts: list[str] = []
     receipt_normalizations: list[str] = []
+    receipt_format_error: str | None = None
     usage_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
     duration_ms = 0
     fallback_reason = (
@@ -510,8 +752,43 @@ def run_task(
     ):
         fallback_reason = resolution.reason
 
+    def remaining_timeout(*, cap: int | None = None) -> int:
+        remaining = max(0, math.ceil(deadline - time.monotonic()))
+        return min(remaining, cap) if cap is not None else remaining
+
+    def prepare_receipt(raw: str, executor: ExecutorSpec) -> str:
+        try:
+            if executor.receipt_mode == RECEIPT_JSON_OBJECT_ADAPTER:
+                prepared, normalized = adapt_json_object_receipt(raw, expected_objective_id)
+            else:
+                prepared, normalized = _normalize_receipt_text(raw)
+                valid_attempt, attempt_errors, attempt_receipt = validate_receipt(prepared)
+                if not valid_attempt or attempt_receipt is None:
+                    raise ReceiptFormatFailure(
+                        f"{executor.provider} returned an invalid receipt: " + "; ".join(attempt_errors),
+                        raw=raw,
+                    )
+                if attempt_receipt.get("objective_id") != expected_objective_id:
+                    raise ReceiptFormatFailure(
+                        f"{executor.provider} returned a receipt for a different objective_id",
+                        raw=raw,
+                    )
+            receipt_normalizations.extend(
+                field for field in normalized if field not in receipt_normalizations
+            )
+            return prepared
+        except ReceiptFormatFailure as exc:
+            raise ReceiptFormatFailure(
+                exc.detail,
+                raw=exc.raw or raw,
+                may_have_mutated=role in WRITER_ROLES,
+            ) from exc
+
     def execute(executor: ExecutorSpec) -> tuple[str, str | None]:
         nonlocal duration_ms
+        attempt_timeout = remaining_timeout()
+        if attempt_timeout <= 0:
+            raise ChildFailure("shared end-to-end deadline exhausted before the next executor")
         attempts.append(executor.id)
         try:
             raw, key, usage, elapsed = _invoke(
@@ -519,15 +796,11 @@ def run_task(
                 task,
                 executor,
                 target_workspace,
-                timeout,
+                attempt_timeout,
                 image_paths,
                 env,
                 codex_home,
                 expected_objective_id,
-            )
-            raw, normalized = _normalize_receipt_text(raw)
-            receipt_normalizations.extend(
-                field for field in normalized if field not in receipt_normalizations
             )
         except ChildFailure as exc:
             duration_ms += exc.duration_ms
@@ -537,24 +810,13 @@ def run_task(
         duration_ms += elapsed
         for name in usage_total:
             usage_total[name] += int(usage.get(name, 0))
-        return raw, key
+        return prepare_receipt(raw, executor), key
 
     def execute_with_fallback() -> tuple[str, ExecutorSpec, str | None]:
+        nonlocal receipt_format_error
         executor = resolution.executor
         try:
             raw, _ = execute(executor)
-            valid_attempt, attempt_errors, _ = validate_receipt(raw)
-            if not valid_attempt:
-                raise ChildFailure(
-                    f"{executor.provider} returned an invalid receipt: " + "; ".join(attempt_errors),
-                    may_have_mutated=role in WRITER_ROLES,
-                )
-            attempt_receipt = json.loads(raw)
-            if attempt_receipt.get("objective_id") != expected_objective_id:
-                raise ChildFailure(
-                    f"{executor.provider} returned a receipt for a different objective_id",
-                    may_have_mutated=role in WRITER_ROLES,
-                )
             if executor.provider == GLM_PROVIDER_ID:
                 record_glm_success(
                     codex_home,
@@ -569,6 +831,36 @@ def run_task(
                     expected_generation=resolution.health_generation,
                 )
             return raw, executor, fallback_reason
+        except ReceiptFormatFailure as exc:
+            receipt_format_error = exc.detail
+            if resolution.local_available and resolution.local_config is not None:
+                # A completed local request with a bad shape is not a transport/provider-health outage.
+                record_local_success(
+                    resolution.local_config,
+                    codex_home,
+                    int(now.timestamp()) if now is not None else None,
+                    expected_generation=resolution.health_generation,
+                )
+                fallback = EXECUTORS["luna_scout" if role == "router_scout" else "luna_monitor"]
+                raw, _ = execute(fallback)
+                return raw, fallback, "local_receipt_format_failure"
+            if executor.provider != GLM_PROVIDER_ID:
+                raise
+            # The primary provider request completed: formatting is a capability issue, not a health failure.
+            record_glm_success(
+                codex_home,
+                int(now.timestamp()) if now is not None else None,
+                expected_generation=resolution.health_generation,
+            )
+            if role in WRITER_ROLES and exc.may_have_mutated:
+                raise ChildFailure(
+                    "GLM child completed after possible workspace mutation, but its receipt could not be "
+                    "normalized; automatic writer fallback was suppressed. " + exc.detail,
+                    may_have_mutated=True,
+                ) from exc
+            fallback = _fallback_executor(role)
+            raw, _ = execute(fallback)
+            return raw, fallback, "glm_receipt_format_failure"
         except ChildFailure as exc:
             if resolution.local_available and resolution.local_config is not None:
                 key = local_provider_key(resolution.local_config, env, codex_home)
@@ -586,7 +878,13 @@ def run_task(
             if executor.provider != GLM_PROVIDER_ID:
                 raise
             key = glm_key(env, codex_home)
-            record_glm_failure(exc.detail, key, codex_home, int(now.timestamp()) if now is not None else None)
+            record_glm_failure(
+                exc.detail,
+                key,
+                codex_home,
+                int(now.timestamp()) if now is not None else None,
+                base_url=executor.base_url,
+            )
             if role in WRITER_ROLES and exc.may_have_mutated:
                 raise ChildFailure(
                     "GLM child failed after possible workspace mutation; automatic writer fallback was suppressed. "
@@ -622,6 +920,8 @@ def run_task(
         "usage": usage_total,
         "duration_ms": duration_ms,
         "receipt_normalizations": receipt_normalizations,
+        "receipt_format_error": receipt_format_error,
+        "receipt_mode": executor.receipt_mode,
     }
     return receipt
 

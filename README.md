@@ -30,6 +30,8 @@
 
 GLM 默认在周一至周五 `14:00–18:00`（`Asia/Shanghai`）切换到 Terra，周末不切换。遇到 Coding Plan 配额错误时，插件从响应中的 `next_flush_time` 建立跨项目共享熔断；短暂故障、认证错误和订阅异常也会按不同策略降级。恢复时间到达后只放行一个半开探针，成功才关闭熔断。策略可在本地 `~/.codex/smart-router/policy.json` 覆盖，格式与默认值见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+v0.4.1 不再假设 GLM 官方端点或 MAAS 中转会严格执行 OpenAI `text.format/json_schema strict`。GLM 先返回较浅的 wire receipt，wrapper 再以无模型、确定性的 adapter 生成严格 receipt v2；格式偏差不会打开 provider 熔断。无法安全转换的只读任务才在同一个总 deadline 内回退 Terra，不再额外调用一个“格式修复模型”。内网 MAAS 可通过 policy 显式配置，见 [内网 GLM 接入](docs/INNER_NETWORK_GLM.md)。
+
 本地文本 provider 使用独立的 60 秒运行时熔断，回退链为 `Local Text → Luna → Sol`；它不会打开或关闭重任务 GLM 熔断。当前 GLM-5.3 surrogate 只用于验证路由、Responses 协议、密钥隔离和回退，不代表 DeepSeek V4 Flash 的真实质量、时延、并发能力或端点兼容性。正式接入的内网服务必须提供 Codex 当前支持的 OpenAI Responses API；可用 `configure_local_provider.py --help` 查看无鉴权内网端点和自定义配置参数。
 
 ## 日常交互
@@ -60,6 +62,6 @@ GLM 默认在周一至周五 `14:00–18:00`（`Asia/Shanghai`）切换到 Terra
 - 每个用户目标默认只有一个委派槽；已经派出 Hegel 等外部 subagent 时，同一目标不会再追加 Luna/Terra 审核。路由角色禁用原生 spawn，统一通过同步 MCP 执行并在返回时自动恢复主 Sol。hook 以文件锁原子消费槽位，并签发一次性 `lease_id`；MCP 再校验 decision、role 与 task digest 后才启动任务。每次 wrapper 写租约绑定 `tool_use_id`；运行时漏发完成事件时，下一条用户任务只会在工作区进程锁证明没有 writer 运行时清理遗留租约。
 - receipt v2 严格拒绝额外字段并限制每个 manifest 字段长度，记录覆盖范围、不一致项、结构化证据清单和最多三项父级抽查建议。主 Agent 只复核关键哈希、异常和少量样本，不重新通读已覆盖材料。执行元数据只记录模型、provider、耗时和 token usage，不保存子模型推理正文。
 - hook 对单次附加上下文设置 512 token 上限；默认 `OFF` 的正常新会话不注入上下文。逐轮路由提示采用紧凑契约，receipt 也限制字段、条目数和单项长度，避免长会话中路由元数据无界增长。
-- 主执行路径是本地 `smart_router.route_task`：它调用隔离的 `codex exec`，固定角色模型，并为 GLM/本地文本路径固定经严格校验的 Responses provider，再用 JSON Schema 校验 receipt。本地配置不能注入任意 TOML；HTTP 默认只接受 localhost 或私有/回环 IP，其他 HTTP hostname 需要显式 `--allow-insecure-http`。GLM 失败后，只有只读任务或可以确认没有发生写入的 worker 才自动重试 Terra；出现工具活动或工作区变化时禁止第二个 writer，交回 Sol 处理。`run_agent.py` 也可单独用于诊断。
+- 主执行路径是本地 `smart_router.route_task`：它调用隔离的 `codex exec`，固定角色模型/provider，并始终在主进程校验最终 receipt v2。OpenAI 模型使用 strict schema；GLM 使用 `json_object_adapter`，不把上游“接受了 schema 参数”等同于“真正执行了 schema”。本地配置不能注入任意 TOML；HTTP 默认只接受 localhost 或私有/回环 IP，其他 HTTP hostname 需要显式允许。GLM 运行失败后，只有只读任务或可以确认没有发生写入的 worker 才自动重试 Terra；出现工具活动或工作区变化时禁止第二个 writer，交回 Sol 处理。`run_agent.py` 也可单独用于诊断。
 
 验证方法见 [TESTING.md](docs/TESTING.md)，架构与故障恢复见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。

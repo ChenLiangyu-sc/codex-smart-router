@@ -16,6 +16,8 @@
 
 `LOCAL_TEXT_FIRST` 仅影响 scout；tester/docs 因可能写入而继续由 Luna 执行，monitor 已改为确定性等待。本地文本 provider 使用独立短熔断并回退 Luna，不修改 GLM 重任务健康状态。它是纯文本路径，不能接收图片。GLM-5.3 surrogate 只能验证路由、Responses provider、凭据隔离和回退，不能证明 DeepSeek V4 Flash 的真实质量、时延或端点兼容性。
 
+GLM 官方端点和 MAAS 中转统一按 `json_object_adapter` 能力处理：先以无模型 adapter 确定性转换 shallow wire receipt；无法安全转换的只读任务在剩余 deadline 内回退 Terra，不启动第二个格式模型。格式偏差不计为 provider 健康故障；运行时失败才触发熔断。writer 已可能修改工作区时不得启动 Terra writer。内网 base URL 只允许通过本地 policy 显式配置。
+
 包含图片的 worker/reviewer 任务强制 Terra；Luna 角色不接收图片。GLM writer 失败时，只有在没有工具活动且工作区指纹未变的情况下才能自动启动 Terra writer；存在可能已写入的证据时返回 Sol 检查，避免双 writer 冲突。
 
 硬性保留给 Sol 的信号包括：身份验证、权限、密钥、支付、安全边界、生产部署、不可逆删除、数据库迁移、并发一致性、跨系统架构和需求边界不清。
