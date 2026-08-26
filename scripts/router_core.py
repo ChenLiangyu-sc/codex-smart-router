@@ -19,6 +19,9 @@ from provider_policy import (
     LIGHT_PROFILES,
     LIGHT_PROFILE_LOCAL_TEXT_FIRST,
     LIGHT_PROFILE_LUNA_STABLE,
+    LUNA_BOUNDED,
+    LUNA_DISABLED,
+    LUNA_MODES,
     PROFILE_GLM_FIRST,
     PROFILE_STABLE,
 )
@@ -38,12 +41,12 @@ ROLES = {
 MODEL_ROLES = ROLES - {"router_monitor"}
 WRITER_ROLES = {"router_worker", "router_tester", "router_docs"}
 ROLE_LABELS = {
-    "router_scout": "Luna · 只读侦察",
+    "router_scout": "只读侦察",
     "router_worker": "Terra · 执行",
     "router_reviewer": "Terra · 审查",
     "router_monitor": "确定性长等待（无模型）",
-    "router_tester": "Luna · 测试",
-    "router_docs": "Luna · 文档",
+    "router_tester": "测试",
+    "router_docs": "文档",
 }
 STATE_TTL_SECONDS = 30 * 24 * 60 * 60
 
@@ -108,6 +111,10 @@ CONTROL_PATTERNS = (
     (re.compile(r"/router\s+local\s+on\b", re.I), "LOCAL_ON"),
     (re.compile(r"\$router-control\s*(?:local\s*(?:关闭|停用|off)|(?:关闭|停用)\s*local)\b", re.I), "LOCAL_OFF"),
     (re.compile(r"/router\s+local\s+off\b", re.I), "LOCAL_OFF"),
+    (re.compile(r"\$router-control\s*(?:luna\s*(?:开启|启用|on)|(?:开启|启用)\s*luna)\b", re.I), "LUNA_ON"),
+    (re.compile(r"/router\s+luna\s+on\b", re.I), "LUNA_ON"),
+    (re.compile(r"\$router-control\s*(?:luna\s*(?:关闭|停用|off)|(?:关闭|停用)\s*luna)\b", re.I), "LUNA_OFF"),
+    (re.compile(r"/router\s+luna\s+off\b", re.I), "LUNA_OFF"),
     (re.compile(r"\$router-control\s*(?:glm\s*(?:开启|启用|on)|(?:开启|启用)\s*glm)\b", re.I), "GLM_ON"),
     (re.compile(r"/router\s+glm\s+on\b", re.I), "GLM_ON"),
     (re.compile(r"\$router-control\s*(?:glm\s*(?:关闭|停用|off)|(?:关闭|停用)\s*glm)\b", re.I), "GLM_OFF"),
@@ -491,11 +498,12 @@ def consume_runtime_lease(
 def default_state(session_id: str) -> dict[str, Any]:
     now = int(time.time())
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "session_key": session_key(session_id),
         "mode": "OFF",
         "execution_profile": PROFILE_STABLE,
         "light_profile": LIGHT_PROFILE_LUNA_STABLE,
+        "luna_mode": LUNA_DISABLED,
         "economics_policy": DEFAULT_ECONOMICS_POLICY,
         "created_at": now,
         "updated_at": now,
@@ -537,11 +545,18 @@ def load_state(root: Path, session_id: str) -> dict[str, Any]:
         return default_state(session_id)
     # Additive migration keeps an existing session's mode while enabling newer
     # user-facing execution history.
-    state["schema_version"] = 7
+    prior_schema = state.get("schema_version")
+    state["schema_version"] = 8
     profile = str(state.get("execution_profile") or PROFILE_STABLE).upper()
     state["execution_profile"] = profile if profile in EXECUTION_PROFILES else PROFILE_STABLE
     light_profile = str(state.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
     state["light_profile"] = light_profile if light_profile in LIGHT_PROFILES else LIGHT_PROFILE_LUNA_STABLE
+    luna_mode = str(state.get("luna_mode") or "").upper()
+    # Pre-v8 states never carried explicit Luna user consent: their implicit
+    # LUNA_STABLE light profile must migrate to LUNA_DISABLED, not inherit Luna.
+    if not (isinstance(prior_schema, int) and prior_schema >= 8 and luna_mode in LUNA_MODES):
+        luna_mode = LUNA_DISABLED
+    state["luna_mode"] = luna_mode
     economics_policy = str(state.get("economics_policy") or DEFAULT_ECONOMICS_POLICY).upper()
     state["economics_policy"] = (
         economics_policy if economics_policy in ECONOMICS_POLICIES else DEFAULT_ECONOMICS_POLICY
@@ -643,6 +658,26 @@ def set_economics_policy(root: Path, session_id: str, policy: str) -> dict[str, 
         raise ValueError(f"unsupported economics policy: {policy}")
     state = load_state(root, session_id)
     state["economics_policy"] = normalized
+    state["last_decision"] = None
+    state["repair_attempts"] = 0
+    save_state(root, session_id, state)
+    return state
+
+
+def set_luna_mode(
+    root: Path,
+    session_id: str,
+    luna_mode: str,
+    *,
+    activate: bool = False,
+) -> dict[str, Any]:
+    normalized = luna_mode.upper()
+    if normalized not in LUNA_MODES:
+        raise ValueError(f"unsupported luna mode: {luna_mode}")
+    state = load_state(root, session_id)
+    state["luna_mode"] = normalized
+    if activate:
+        state["mode"] = "ON"
     state["last_decision"] = None
     state["repair_attempts"] = 0
     save_state(root, session_id, state)
@@ -1317,11 +1352,36 @@ def validate_receipt(raw: str) -> tuple[bool, list[str], dict[str, Any] | None]:
     return not errors, errors, receipt
 
 
+def recommended_executor_label(
+    role: str,
+    execution_profile: str = PROFILE_STABLE,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+    luna_mode: str = LUNA_DISABLED,
+) -> str:
+    """Preview the first two executors of the planned chain for one role."""
+    if role in {"router_worker", "router_reviewer"}:
+        if str(execution_profile).upper() == PROFILE_GLM_FIRST:
+            return "GLM-5.3 Max / Terra 动态执行"
+        return ROLE_LABELS.get(role, "Sol")
+    candidates: list[str] = []
+    if role == "router_scout" and str(light_profile).upper() == LIGHT_PROFILE_LOCAL_TEXT_FIRST:
+        candidates.append("Local Text")
+    if str(luna_mode).upper() == LUNA_BOUNDED:
+        candidates.append("Luna")
+    if str(execution_profile).upper() == PROFILE_GLM_FIRST:
+        candidates.append("GLM")
+    candidates.append("Terra")
+    if len(candidates) == 1:
+        return f"Terra · {ROLE_LABELS.get(role, role)}"
+    return " / ".join(candidates[:2]) + " 动态执行"
+
+
 def routing_context(
     mode: str,
     decision: dict[str, Any],
     execution_profile: str = PROFILE_STABLE,
     light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+    luna_mode: str = LUNA_DISABLED,
 ) -> str:
     role = decision.get("role") or "main_sol"
     if mode == "SHADOW":
@@ -1329,12 +1389,8 @@ def routing_context(
             recommendation = "确定性工具 fast path"
         elif decision["decision"] != "DELEGATE":
             recommendation = "Sol"
-        elif execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
-            recommendation = "GLM-5.3 Max / Terra 动态执行"
-        elif light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and role == "router_scout":
-            recommendation = "Local Text / Luna 动态执行"
         else:
-            recommendation = ROLE_LABELS.get(role, "Sol")
+            recommendation = recommended_executor_label(role, execution_profile, light_profile, luna_mode)
         return (
             f"SR_SHADOW recommended={role} risk={decision['risk']}. Do not delegate; handle normally in Sol. "
             f'End the answer with exactly: "路由预览：{recommendation}".'
@@ -1367,7 +1423,7 @@ def routing_context(
         else ""
     )
     return (
-        f"SR_ON DELEGATE decision_id={decision_id} lease_id={lease_id} role={role} profile={execution_profile} light={light_profile} write={write_flag}. "
+        f"SR_ON DELEGATE decision_id={decision_id} lease_id={lease_id} role={role} profile={execution_profile} light={light_profile} luna={luna_mode} write={write_flag}. "
         "Call smart_router.route_task once with exact values; no subagents."
         f"{batch_instruction}{image_instruction} "
         "Verify only receipt checks/anomalies/sample; do not reread all. "

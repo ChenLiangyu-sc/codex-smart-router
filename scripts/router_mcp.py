@@ -16,9 +16,11 @@ from provider_policy import (
     EXECUTION_PROFILES,
     LIGHT_PROFILES,
     LIGHT_PROFILE_LUNA_STABLE,
+    LUNA_DISABLED,
+    LUNA_MODES,
     PROFILE_STABLE,
 )
-from run_agent import ROLE_SETTINGS, run_task
+from run_agent import ROLE_SETTINGS, RoutedTaskFailure, run_task
 from router_core import consume_runtime_lease, data_root, delegation_task_digest
 
 _REPLY_LOCK = threading.Lock()
@@ -66,10 +68,11 @@ def tool_definition() -> dict[str, Any]:
         "name": "route_task",
         "title": "Run one bounded routed task",
         "description": (
-            "Run one low-risk task with the exact SR_ON role and execution profile. "
-            "LUNA_STABLE handles light roles with Luna; LOCAL_TEXT_FIRST dynamically uses a configured text-only "
-            "provider for scout with Luna fallback. GLM_FIRST selects GLM-5.3 Max for eligible text work and "
-            "automatically uses Terra for peak windows, provider fallback, or attached images."
+            "Run one low-risk task with the exact SR_ON role, profiles, and luna mode. "
+            "Luna is opt-in: with LUNA_DISABLED it never executes, and light roles follow the "
+            "Local/GLM/Terra chain; LUNA_BOUNDED only admits low-risk bounded scout/tester/docs tasks. "
+            "GLM_FIRST selects GLM-5.3 for eligible text work and automatically uses Terra for peak "
+            "windows, provider fallback, or attached images. At most two models actually execute."
         ),
         "inputSchema": {
             "type": "object",
@@ -93,6 +96,11 @@ def tool_definition() -> dict[str, Any]:
                     "type": "string",
                     "enum": sorted(LIGHT_PROFILES),
                     "default": LIGHT_PROFILE_LUNA_STABLE,
+                },
+                "luna_mode": {
+                    "type": "string",
+                    "enum": sorted(LUNA_MODES),
+                    "default": LUNA_DISABLED,
                 },
                 "images": {
                     "type": "array",
@@ -269,6 +277,7 @@ def handle(message: dict[str, Any], cancel_event: threading.Event | None = None)
                 raise ValueError("router_monitor must use wait_for_condition; model polling is disabled")
             profile = str(args.get("execution_profile") or PROFILE_STABLE).upper()
             light_profile = str(args.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
+            luna_mode = str(args.get("luna_mode") or LUNA_DISABLED).upper()
             images = args.get("images") or []
             if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
                 raise ValueError("images must be an array of local path strings")
@@ -277,6 +286,7 @@ def handle(message: dict[str, Any], cancel_event: threading.Event | None = None)
                 str(args.get("task") or ""),
                 execution_profile=profile,
                 light_profile=light_profile,
+                luna_mode=luna_mode,
                 images=images,
                 timeout=int(args.get("timeout_seconds", 900)),
                 objective_id=decision_id,
@@ -288,6 +298,19 @@ def handle(message: dict[str, Any], cancel_event: threading.Event | None = None)
                     "content": [{"type": "text", "text": json.dumps(receipt, ensure_ascii=False)}],
                     "structuredContent": receipt,
                     "isError": failed,
+                },
+            )
+        except RoutedTaskFailure as exc:
+            # Every planned executor failed: still return the structured
+            # fallback ledger so hooks, telemetry, and the status page record
+            # the same route path a successful run would have shown.
+            failure = {"status": "failed", "_router_meta": exc.router_meta}
+            reply(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": json.dumps(failure, ensure_ascii=False)}],
+                    "structuredContent": failure,
+                    "isError": True,
                 },
             )
         except Exception as exc:

@@ -13,7 +13,7 @@ import re
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
@@ -37,6 +37,10 @@ LIGHT_PROFILE_LUNA_STABLE = "LUNA_STABLE"
 LIGHT_PROFILE_LOCAL_TEXT_FIRST = "LOCAL_TEXT_FIRST"
 LIGHT_PROFILES = {LIGHT_PROFILE_LUNA_STABLE, LIGHT_PROFILE_LOCAL_TEXT_FIRST}
 
+LUNA_DISABLED = "LUNA_DISABLED"
+LUNA_BOUNDED = "LUNA_BOUNDED"
+LUNA_MODES = {LUNA_DISABLED, LUNA_BOUNDED}
+
 GLM_ENV_KEY = "ZHIPU_API_KEY"
 GLM_PROVIDER_ID = "zhipu_glm_coding"
 GLM_BASE_URL = "https://open.bigmodel.cn/api/v1"
@@ -44,10 +48,6 @@ GLM_MODEL = "glm-5.3"
 
 RECEIPT_STRICT_JSON_SCHEMA = "strict_json_schema"
 RECEIPT_JSON_OBJECT_ADAPTER = "json_object_adapter"
-
-LUNA_ROLES = {"router_scout", "router_monitor", "router_tester", "router_docs"}
-LOCAL_TEXT_ELIGIBLE_ROLES = {"router_scout", "router_monitor"}
-GLM_ELIGIBLE_ROLES = {"router_worker", "router_reviewer"}
 
 QUOTA_5H_CODES = {1308, 1316, 1318, 1320}
 QUOTA_7D_CODES = {1310, 1317, 1319, 1321}
@@ -86,13 +86,46 @@ class Resolution:
     local_config: LocalProviderConfig | None = None
 
 
+@dataclass(frozen=True)
+class ChainPlan:
+    """Ordered post-selection executor chain plus selection-time bypass reasons."""
+
+    chain: tuple[ExecutorSpec, ...]
+    bypass: dict[str, str]
+    selection_reason: str
+    glm_available: bool = False
+    local_available: bool = False
+    health_generations: dict[str, int] = field(default_factory=dict)
+    requested_profile: str = PROFILE_STABLE
+    requested_light_profile: str = LIGHT_PROFILE_LUNA_STABLE
+    requested_luna_mode: str = LUNA_DISABLED
+    local_config: LocalProviderConfig | None = None
+
+
 EXECUTORS = {
     "luna_scout": ExecutorSpec("luna_scout", "openai", "gpt-5.6-luna", "medium", "read-only", "Luna · 只读侦察"),
-    "luna_monitor": ExecutorSpec("luna_monitor", "openai", "gpt-5.6-luna", "low", "read-only", "Luna · 监控"),
     "luna_tester": ExecutorSpec("luna_tester", "openai", "gpt-5.6-luna", "medium", "workspace-write", "Luna · 测试"),
     "luna_docs": ExecutorSpec("luna_docs", "openai", "gpt-5.6-luna", "medium", "workspace-write", "Luna · 文档"),
+    "terra_scout": ExecutorSpec("terra_scout", "openai", "gpt-5.6-terra", "medium", "read-only", "Terra · 只读侦察"),
+    "terra_tester": ExecutorSpec("terra_tester", "openai", "gpt-5.6-terra", "medium", "workspace-write", "Terra · 测试"),
+    "terra_docs": ExecutorSpec("terra_docs", "openai", "gpt-5.6-terra", "medium", "workspace-write", "Terra · 文档"),
     "terra_worker": ExecutorSpec("terra_worker", "openai", "gpt-5.6-terra", "medium", "workspace-write", "Terra · 执行"),
     "terra_reviewer": ExecutorSpec("terra_reviewer", "openai", "gpt-5.6-terra", "high", "read-only", "Terra · 审查"),
+    "glm_scout": ExecutorSpec(
+        "glm_scout", GLM_PROVIDER_ID, GLM_MODEL, "max", "read-only", "GLM-5.3 · 只读侦察",
+        "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+        receipt_mode=RECEIPT_JSON_OBJECT_ADAPTER,
+    ),
+    "glm_tester": ExecutorSpec(
+        "glm_tester", GLM_PROVIDER_ID, GLM_MODEL, "max", "workspace-write", "GLM-5.3 · 测试",
+        "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+        receipt_mode=RECEIPT_JSON_OBJECT_ADAPTER,
+    ),
+    "glm_docs": ExecutorSpec(
+        "glm_docs", GLM_PROVIDER_ID, GLM_MODEL, "max", "workspace-write", "GLM-5.3 · 文档",
+        "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
+        receipt_mode=RECEIPT_JSON_OBJECT_ADAPTER,
+    ),
     "glm_worker": ExecutorSpec(
         "glm_worker", GLM_PROVIDER_ID, GLM_MODEL, "max", "workspace-write", "GLM-5.3 Max · 执行",
         "Zhipu GLM Coding Plan", GLM_BASE_URL, GLM_ENV_KEY,
@@ -105,12 +138,16 @@ EXECUTORS = {
     ),
 }
 
-ROLE_EXECUTORS = {
-    "router_scout": "luna_scout",
-    "router_monitor": "luna_monitor",
-    "router_tester": "luna_tester",
-    "router_docs": "luna_docs",
+# Every model-backed role maps to one executor per provider kind. Luna never
+# appears for worker/reviewer (complex lane) and Terra is always terminal.
+ROLE_KIND_EXECUTORS = {
+    "router_scout": {"luna": "luna_scout", "glm": "glm_scout", "terra": "terra_scout"},
+    "router_tester": {"luna": "luna_tester", "glm": "glm_tester", "terra": "terra_tester"},
+    "router_docs": {"luna": "luna_docs", "glm": "glm_docs", "terra": "terra_docs"},
+    "router_worker": {"glm": "glm_worker", "terra": "terra_worker"},
+    "router_reviewer": {"glm": "glm_reviewer", "terra": "terra_reviewer"},
 }
+COMPLEX_LANE_ROLES = {"router_worker", "router_reviewer"}
 
 DEFAULT_POLICY: dict[str, Any] = {
     "schema_version": 1,
@@ -507,105 +544,23 @@ def read_health(home: str | Path | None = None) -> dict[str, Any]:
         return dict(_load_health_unlocked(home))
 
 
-def resolve_executor(
+def _glm_candidate(
     role: str,
-    profile: str = PROFILE_STABLE,
-    *,
-    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
-    has_images: bool = False,
-    now: dt.datetime | None = None,
-    env: Mapping[str, str] | None = None,
-    home: str | Path | None = None,
-) -> Resolution:
-    normalized = profile.upper()
-    if normalized not in EXECUTION_PROFILES:
-        raise ValueError(f"unsupported execution profile: {profile}")
-    normalized_light = light_profile.upper()
-    if normalized_light not in LIGHT_PROFILES:
-        raise ValueError(f"unsupported light profile: {light_profile}")
-    if role in ROLE_EXECUTORS:
-        luna = EXECUTORS[ROLE_EXECUTORS[role]]
-        if role not in LOCAL_TEXT_ELIGIBLE_ROLES or normalized_light != LIGHT_PROFILE_LOCAL_TEXT_FIRST:
-            return Resolution(
-                luna,
-                normalized,
-                "luna_role",
-                False,
-                requested_light_profile=normalized_light,
-            )
-        config, config_reason = load_local_config(home)
-        if config is None:
-            return Resolution(
-                luna,
-                normalized,
-                f"local_config_{config_reason}",
-                False,
-                requested_light_profile=normalized_light,
-            )
-        key = local_provider_key(config, env, home)
-        if config.env_key and not key:
-            return Resolution(
-                luna,
-                normalized,
-                "local_key_missing",
-                False,
-                requested_light_profile=normalized_light,
-                local_config=config,
-            )
-        epoch = int(now.timestamp()) if now is not None else int(time.time())
-        available, reason, health = local_health_available(config, key, epoch, home)
-        if not available:
-            return Resolution(
-                luna,
-                normalized,
-                f"local_{reason}",
-                False,
-                requested_light_profile=normalized_light,
-                local_config=config,
-            )
-        role_suffix = "scout" if role == "router_scout" else "monitor"
-        role_label = "只读侦察" if role == "router_scout" else "监控"
-        executor = ExecutorSpec(
-            f"local_{role_suffix}",
-            config.provider_id,
-            config.model,
-            config.reasoning_effort,
-            "read-only",
-            f"{config.display_name} · {role_label}",
-            config.display_name,
-            config.base_url,
-            config.env_key,
-            config.wire_api,
-            str(local_model_catalog_path(home)),
-            local_config_fingerprint(config),
-        )
-        return Resolution(
-            executor,
-            normalized,
-            reason,
-            False,
-            int(health.get("generation") or 0),
-            normalized_light,
-            True,
-            config,
-        )
-    if role not in GLM_ELIGIBLE_ROLES:
-        raise ValueError(f"unknown role: {role}")
-    terra = EXECUTORS["terra_worker" if role == "router_worker" else "terra_reviewer"]
-    glm = EXECUTORS["glm_worker" if role == "router_worker" else "glm_reviewer"]
-    if normalized != PROFILE_GLM_FIRST:
-        return Resolution(terra, normalized, "stable_profile", False, requested_light_profile=normalized_light)
-    if has_images:
-        return Resolution(terra, normalized, "multimodal_requires_terra", False, requested_light_profile=normalized_light)
+    now: dt.datetime | None,
+    env: Mapping[str, str] | None,
+    home: str | Path | None,
+) -> tuple[bool, str, ExecutorSpec, int]:
+    """Resolve one role's GLM executor without images; never mutates health on failure."""
+    glm = EXECUTORS[ROLE_KIND_EXECUTORS[role]["glm"]]
     policy = load_policy(home)
     if policy.get("invalid"):
-        return Resolution(terra, normalized, "invalid_policy", False, requested_light_profile=normalized_light)
+        return False, "invalid_policy", glm, 0
     if is_peak_window(now, policy):
-        return Resolution(terra, normalized, "glm_peak_window", False, requested_light_profile=normalized_light)
+        return False, "glm_peak_window", glm, 0
     glm = replace(glm, base_url=str(policy["glm_base_url"]))
     key = glm_key(env, home)
     if not key:
-        return Resolution(terra, normalized, "glm_key_missing", False, requested_light_profile=normalized_light)
+        return False, "glm_key_missing", glm, 0
     epoch = int(local_now(policy, now).timestamp()) if now is not None else int(time.time())
     available, reason, health = glm_health_available(
         key,
@@ -614,14 +569,184 @@ def resolve_executor(
         base_url=str(policy["glm_base_url"]),
     )
     if not available:
-        return Resolution(terra, normalized, f"glm_{reason}", False, requested_light_profile=normalized_light)
+        return False, f"glm_{reason}", glm, 0
+    return True, reason, glm, int(health.get("generation") or 0)
+
+
+def _local_candidate(
+    role: str,
+    env: Mapping[str, str] | None,
+    home: str | Path | None,
+    now: dt.datetime | None = None,
+) -> tuple[bool, str, ExecutorSpec | None, LocalProviderConfig | None, int]:
+    """Resolve the read-only local text executor for scout/monitor roles."""
+    config, config_reason = load_local_config(home)
+    if config is None:
+        return False, f"local_config_{config_reason}", None, None, 0
+    key = local_provider_key(config, env, home)
+    if config.env_key and not key:
+        return False, "local_key_missing", None, config, 0
+    epoch = int(now.timestamp()) if now is not None else int(time.time())
+    available, reason, health = local_health_available(config, key, epoch, home)
+    if not available:
+        return False, f"local_{reason}", None, config, 0
+    role_suffix = "scout" if role == "router_scout" else "monitor"
+    role_label = "只读侦察" if role == "router_scout" else "监控"
+    executor = ExecutorSpec(
+        f"local_{role_suffix}",
+        config.provider_id,
+        config.model,
+        config.reasoning_effort,
+        "read-only",
+        f"{config.display_name} · {role_label}",
+        config.display_name,
+        config.base_url,
+        config.env_key,
+        config.wire_api,
+        str(local_model_catalog_path(home)),
+        local_config_fingerprint(config),
+    )
+    return True, reason, executor, config, int(health.get("generation") or 0)
+
+
+def plan_executor_chain(
+    role: str,
+    *,
+    execution_profile: str = PROFILE_STABLE,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+    luna_mode: str = LUNA_DISABLED,
+    has_images: bool = False,
+    now: dt.datetime | None = None,
+    env: Mapping[str, str] | None = None,
+    home: str | Path | None = None,
+) -> ChainPlan:
+    """Plan the ordered executor chain for one routed task.
+
+    Selection-time bypasses (missing config/key, circuit open, peak window,
+    multimodal) never count as model attempts; the caller caps actual model
+    invocations at two. Terra is always the terminal executor and Luna never
+    enters the chain for complex worker/reviewer roles or when disabled.
+    """
+    normalized = str(execution_profile).upper()
+    if normalized not in EXECUTION_PROFILES:
+        raise ValueError(f"unsupported execution profile: {execution_profile}")
+    normalized_light = str(light_profile).upper()
+    if normalized_light not in LIGHT_PROFILES:
+        raise ValueError(f"unsupported light profile: {light_profile}")
+    normalized_luna = str(luna_mode).upper()
+    if normalized_luna not in LUNA_MODES:
+        raise ValueError(f"unsupported luna mode: {luna_mode}")
+
+    bypass: dict[str, str] = {}
+    if role == "router_monitor":
+        # The deterministic wait lane has no model executor at all: monitoring
+        # must go through smart_router.wait_for_condition, so the planner never
+        # returns a Luna (or any) executor for this role.
+        raise ValueError("router_monitor has no model executor; use smart_router.wait_for_condition")
+    if role not in ROLE_KIND_EXECUTORS:
+        raise ValueError(f"unknown role: {role}")
+
+    kinds = ROLE_KIND_EXECUTORS[role]
+    terra = EXECUTORS[kinds["terra"]]
+    if role in COMPLEX_LANE_ROLES:
+        if normalized != PROFILE_GLM_FIRST:
+            return ChainPlan((terra,), bypass, "stable_profile", requested_profile=normalized,
+                             requested_light_profile=normalized_light, requested_luna_mode=normalized_luna)
+        if has_images:
+            # Text-only GLM must never receive image input.
+            bypass["glm"] = "multimodal_requires_terra"
+            return ChainPlan((terra,), bypass, "multimodal_requires_terra",
+                             requested_profile=normalized, requested_light_profile=normalized_light,
+                             requested_luna_mode=normalized_luna)
+        available, reason, glm, generation = _glm_candidate(role, now, env, home)
+        if available:
+            return ChainPlan((glm, terra), bypass, reason, glm_available=True,
+                             health_generations={GLM_PROVIDER_ID: generation},
+                             requested_profile=normalized, requested_light_profile=normalized_light,
+                             requested_luna_mode=normalized_luna)
+        bypass["glm"] = reason
+        return ChainPlan((terra,), bypass, reason, requested_profile=normalized,
+                         requested_light_profile=normalized_light, requested_luna_mode=normalized_luna)
+
+    chain: list[ExecutorSpec] = []
+    local_available = False
+    local_config: LocalProviderConfig | None = None
+    glm_available = False
+    health_generations: dict[str, int] = {}
+    selection_reason: str | None = None
+    if role == "router_scout" and normalized_light == LIGHT_PROFILE_LOCAL_TEXT_FIRST:
+        available, reason, executor, config, local_generation = _local_candidate(role, env, home, now)
+        if available:
+            chain.append(executor)
+            local_available = True
+            local_config = config
+            health_generations[config.provider_id] = local_generation
+            selection_reason = reason
+        else:
+            bypass["local"] = reason
+            local_config = config
+    if normalized_luna == LUNA_BOUNDED:
+        chain.append(EXECUTORS[kinds["luna"]])
+        if selection_reason is None:
+            selection_reason = "luna_role"
+    if normalized == PROFILE_GLM_FIRST:
+        available, reason, glm, glm_generation = _glm_candidate(role, now, env, home)
+        if available:
+            chain.append(glm)
+            glm_available = True
+            health_generations[GLM_PROVIDER_ID] = glm_generation
+            if selection_reason is None:
+                selection_reason = reason
+        else:
+            bypass.setdefault("glm", reason)
+    chain.append(terra)
+    if selection_reason is None:
+        selection_reason = next(iter(bypass.values()), "luna_disabled")
+    return ChainPlan(
+        tuple(chain),
+        bypass,
+        selection_reason,
+        glm_available=glm_available,
+        local_available=local_available,
+        health_generations=health_generations,
+        requested_profile=normalized,
+        requested_light_profile=normalized_light,
+        requested_luna_mode=normalized_luna,
+        local_config=local_config,
+    )
+
+
+def resolve_executor(
+    role: str,
+    profile: str = PROFILE_STABLE,
+    *,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+    luna_mode: str = LUNA_DISABLED,
+    has_images: bool = False,
+    now: dt.datetime | None = None,
+    env: Mapping[str, str] | None = None,
+    home: str | Path | None = None,
+) -> Resolution:
+    """Compatibility view over the planned chain: primary executor and reason."""
+    plan = plan_executor_chain(
+        role,
+        execution_profile=profile,
+        light_profile=light_profile,
+        luna_mode=luna_mode,
+        has_images=has_images,
+        now=now,
+        env=env,
+        home=home,
+    )
     return Resolution(
-        glm,
-        normalized,
-        reason,
-        True,
-        int(health.get("generation") or 0),
-        normalized_light,
+        plan.chain[0],
+        plan.requested_profile,
+        plan.selection_reason,
+        plan.glm_available,
+        plan.health_generations.get(plan.chain[0].provider, 0),
+        plan.requested_light_profile,
+        plan.local_available,
+        plan.local_config,
     )
 
 

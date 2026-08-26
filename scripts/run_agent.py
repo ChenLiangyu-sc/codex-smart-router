@@ -18,21 +18,20 @@ from typing import Any, Mapping
 
 from provider_policy import (
     EXECUTION_PROFILES,
-    EXECUTORS,
     GLM_ENV_KEY,
     GLM_PROVIDER_ID,
     LIGHT_PROFILES,
-    LIGHT_PROFILE_LOCAL_TEXT_FIRST,
     LIGHT_PROFILE_LUNA_STABLE,
-    LOCAL_TEXT_ELIGIBLE_ROLES,
+    LUNA_DISABLED,
+    LUNA_MODES,
     PROFILE_STABLE,
     RECEIPT_JSON_OBJECT_ADAPTER,
     ExecutorSpec,
     glm_key,
+    plan_executor_chain,
     record_glm_failure,
     record_glm_success,
     redact_secrets,
-    resolve_executor,
 )
 from local_provider import (
     config_fingerprint as local_config_fingerprint,
@@ -69,6 +68,9 @@ ROLE_SETTINGS = {
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NON_TOOL_ITEM_TYPES = {"agent_message", "reasoning", "error", "todo_list"}
 MAX_COVERAGE_COUNT = 1_000_000
+# Each routed task may invoke at most two real models end-to-end; providers
+# bypassed at selection time (missing config/key, circuit, peak) never count.
+MAX_MODEL_ATTEMPTS = 2
 USAGE_TOKEN_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -93,6 +95,40 @@ class ChildFailure(RuntimeError):
         self.may_have_mutated = may_have_mutated
         self.usage = usage or {name: 0 for name in USAGE_TOKEN_FIELDS}
         self.duration_ms = max(0, duration_ms)
+
+
+class DeadlineExhausted(ChildFailure):
+    """The shared end-to-end deadline ran out before the next executor started.
+
+    The candidate executor was never invoked, so this must never be recorded
+    as that provider's runtime failure, and the candidate chain ends here.
+    """
+
+
+class RoutedTaskFailure(ChildFailure):
+    """Every planned executor failed; carries the complete fallback ledger.
+
+    The router_meta dict mirrors the success-path ``_router_meta`` (route path,
+    per-attempt usage/durations, fallback codes) so receipts, session state,
+    telemetry, and the status page stay consistent even when nothing succeeded.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        router_meta: dict[str, Any],
+        may_have_mutated: bool = False,
+        usage: dict[str, Any] | None = None,
+        duration_ms: int = 0,
+    ) -> None:
+        super().__init__(
+            detail,
+            may_have_mutated=may_have_mutated,
+            usage=usage,
+            duration_ms=duration_ms,
+        )
+        self.router_meta = router_meta
 
 
 class ReceiptFormatFailure(ChildFailure):
@@ -718,8 +754,26 @@ def _invoke(
             ) from exc
 
 
-def _fallback_executor(role: str) -> ExecutorSpec:
-    return EXECUTORS["terra_worker" if role == "router_worker" else "terra_reviewer"]
+def _executor_kind(executor: ExecutorSpec) -> str:
+    if executor.provider == GLM_PROVIDER_ID:
+        return "glm"
+    if executor.provider == "openai":
+        if executor.model.endswith("-luna"):
+            return "luna"
+        if executor.model.endswith("-terra"):
+            return "terra"
+    return "local"
+
+
+def _executor_display(executor: ExecutorSpec) -> str:
+    if executor.provider == GLM_PROVIDER_ID:
+        return "GLM-5.3"
+    kind = _executor_kind(executor)
+    if kind == "luna":
+        return "Luna"
+    if kind == "terra":
+        return "Terra"
+    return executor.provider_name or executor.provider
 
 
 def run_task(
@@ -730,6 +784,7 @@ def run_task(
     *,
     execution_profile: str = PROFILE_STABLE,
     light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+    luna_mode: str = LUNA_DISABLED,
     images: list[str] | tuple[str, ...] | None = None,
     now: dt.datetime | None = None,
     env: Mapping[str, str] | None = None,
@@ -741,12 +796,17 @@ def run_task(
     deadline = time.monotonic() + timeout
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
+    if role == "router_monitor":
+        raise ValueError("router_monitor must use smart_router.wait_for_condition; model polling is disabled")
     profile = execution_profile.upper()
     if profile not in EXECUTION_PROFILES:
         raise ValueError(f"unsupported execution profile: {execution_profile}")
     normalized_light = light_profile.upper()
     if normalized_light not in LIGHT_PROFILES:
         raise ValueError(f"unsupported light profile: {light_profile}")
+    normalized_luna = luna_mode.upper()
+    if normalized_luna not in LUNA_MODES:
+        raise ValueError(f"unsupported luna mode: {luna_mode}")
     expected_objective_id = objective_id or hashlib.sha256(task.encode("utf-8", "replace")).hexdigest()
     if not re.fullmatch(r"[0-9a-f]{64}", expected_objective_id):
         raise ValueError("objective_id must be a lowercase SHA-256 hex digest")
@@ -764,10 +824,11 @@ def run_task(
     if image_paths and role in {"router_scout", "router_monitor", "router_tester", "router_docs"}:
         raise ValueError("image inputs require a Terra-capable worker or reviewer role")
     target_workspace = (Path(workspace) if workspace is not None else Path.cwd()).expanduser().resolve()
-    resolution = resolve_executor(
+    plan = plan_executor_chain(
         role,
-        profile,
+        execution_profile=profile,
         light_profile=normalized_light,
+        luna_mode=normalized_luna,
         has_images=bool(image_paths),
         now=now,
         env=env,
@@ -779,21 +840,44 @@ def run_task(
     usage_total = {name: 0 for name in USAGE_TOKEN_FIELDS}
     attempt_usage: list[dict[str, Any]] = []
     duration_ms = 0
-    fallback_reason = (
-        resolution.reason
-        if resolution.executor.provider != GLM_PROVIDER_ID and profile != PROFILE_STABLE and role not in {"router_scout", "router_monitor", "router_tester", "router_docs"}
-        else None
-    )
-    if (
-        normalized_light == LIGHT_PROFILE_LOCAL_TEXT_FIRST
-        and role in LOCAL_TEXT_ELIGIBLE_ROLES
-        and not resolution.local_available
-    ):
-        fallback_reason = resolution.reason
+    selection_bypass_reasons = dict(plan.bypass)
+    selection_bypass_reason = next(iter(plan.bypass.values()), None)
+    fallback_stage: str | None = "selection" if selection_bypass_reason else None
+    fallback_reason_code: str | None = selection_bypass_reason
 
     def remaining_timeout(*, cap: int | None = None) -> int:
         remaining = max(0, math.ceil(deadline - time.monotonic()))
         return min(remaining, cap) if cap is not None else remaining
+
+    def _now_epoch() -> int | None:
+        return int(now.timestamp()) if now is not None else None
+
+    def _expected_generation(executor: ExecutorSpec) -> int | None:
+        return plan.health_generations.get(executor.provider)
+
+    def record_provider_success(executor: ExecutorSpec) -> None:
+        if executor.provider == GLM_PROVIDER_ID:
+            record_glm_success(codex_home, _now_epoch(), expected_generation=_expected_generation(executor))
+        elif plan.local_config is not None and executor.provider == plan.local_config.provider_id:
+            record_local_success(
+                plan.local_config,
+                codex_home,
+                _now_epoch(),
+                expected_generation=_expected_generation(executor),
+            )
+
+    def record_provider_failure(executor: ExecutorSpec, detail: str) -> None:
+        if executor.provider == GLM_PROVIDER_ID:
+            record_glm_failure(detail, glm_key(env, codex_home), codex_home, _now_epoch(), base_url=executor.base_url)
+        elif plan.local_config is not None and executor.provider == plan.local_config.provider_id:
+            record_local_failure(
+                plan.local_config,
+                detail,
+                local_provider_key(plan.local_config, env, codex_home),
+                codex_home,
+                _now_epoch(),
+                expected_generation=_expected_generation(executor),
+            )
 
     def prepare_receipt(raw: str, executor: ExecutorSpec) -> str:
         try:
@@ -823,14 +907,14 @@ def run_task(
                 may_have_mutated=role in WRITER_ROLES,
             ) from exc
 
-    def execute(executor: ExecutorSpec) -> tuple[str, str | None]:
+    def execute(executor: ExecutorSpec) -> str:
         nonlocal duration_ms
         attempt_timeout = remaining_timeout()
         if attempt_timeout <= 0:
-            raise ChildFailure("shared end-to-end deadline exhausted before the next executor")
+            raise DeadlineExhausted("shared end-to-end deadline exhausted before the next executor")
         attempts.append(executor.id)
         try:
-            raw, key, usage, elapsed = _invoke(
+            raw, _key, usage, elapsed = _invoke(
                 role,
                 task,
                 executor,
@@ -848,6 +932,7 @@ def run_task(
             attempt_usage.append(
                 {
                     "executor": executor.id,
+                    "model_label": _executor_display(executor),
                     "outcome": "runtime_failure",
                     "usage": {name: int(exc.usage.get(name, 0)) for name in USAGE_TOKEN_FIELDS},
                     "usage_stream_kind": exc.usage.get("_stream_kind", "unavailable"),
@@ -865,6 +950,7 @@ def run_task(
             attempt_usage.append(
                 {
                     "executor": executor.id,
+                    "model_label": _executor_display(executor),
                     "outcome": "receipt_format_failure",
                     "usage": {name: int(usage.get(name, 0)) for name in USAGE_TOKEN_FIELDS},
                     "usage_stream_kind": usage.get("_stream_kind", "unavailable"),
@@ -876,6 +962,7 @@ def run_task(
         attempt_usage.append(
             {
                 "executor": executor.id,
+                "model_label": _executor_display(executor),
                 "outcome": "completed",
                 "usage": {name: int(usage.get(name, 0)) for name in USAGE_TOKEN_FIELDS},
                 "usage_stream_kind": usage.get("_stream_kind", "unavailable"),
@@ -883,131 +970,138 @@ def run_task(
                 "duration_ms": elapsed,
             }
         )
-        return prepared, key
+        return prepared
 
-    def execute_with_fallback() -> tuple[str, ExecutorSpec, str | None]:
-        nonlocal receipt_format_error
-        executor = resolution.executor
-        try:
-            raw, _ = execute(executor)
-            if executor.provider == GLM_PROVIDER_ID:
-                record_glm_success(
-                    codex_home,
-                    int(now.timestamp()) if now is not None else None,
-                    expected_generation=resolution.health_generation,
-                )
-            elif resolution.local_available and resolution.local_config is not None:
-                record_local_success(
-                    resolution.local_config,
-                    codex_home,
-                    int(now.timestamp()) if now is not None else None,
-                    expected_generation=resolution.health_generation,
-                )
-            return raw, executor, fallback_reason
-        except ReceiptFormatFailure as exc:
-            receipt_format_error = exc.detail
-            if resolution.local_available and resolution.local_config is not None:
-                # A completed local request with a bad shape is not a transport/provider-health outage.
-                record_local_success(
-                    resolution.local_config,
-                    codex_home,
-                    int(now.timestamp()) if now is not None else None,
-                    expected_generation=resolution.health_generation,
-                )
-                fallback = EXECUTORS["luna_scout" if role == "router_scout" else "luna_monitor"]
-                raw, _ = execute(fallback)
-                return raw, fallback, "local_receipt_format_failure"
-            if executor.provider != GLM_PROVIDER_ID:
-                raise
-            # The primary provider request completed: formatting is a capability issue, not a health failure.
-            record_glm_success(
-                codex_home,
-                int(now.timestamp()) if now is not None else None,
-                expected_generation=resolution.health_generation,
-            )
-            if role in WRITER_ROLES and exc.may_have_mutated:
-                raise ChildFailure(
-                    "GLM child completed after possible workspace mutation, but its receipt could not be "
-                    "normalized; automatic writer fallback was suppressed. " + exc.detail,
-                    may_have_mutated=True,
-                ) from exc
-            fallback = _fallback_executor(role)
-            raw, _ = execute(fallback)
-            return raw, fallback, "glm_receipt_format_failure"
-        except ChildFailure as exc:
-            if resolution.local_available and resolution.local_config is not None:
-                key = local_provider_key(resolution.local_config, env, codex_home)
-                record_local_failure(
-                    resolution.local_config,
-                    exc.detail,
-                    key,
-                    codex_home,
-                    int(now.timestamp()) if now is not None else None,
-                    expected_generation=resolution.health_generation,
-                )
-                fallback = EXECUTORS["luna_scout" if role == "router_scout" else "luna_monitor"]
-                raw, _ = execute(fallback)
-                return raw, fallback, "local_runtime_failure"
-            if executor.provider != GLM_PROVIDER_ID:
-                raise
-            key = glm_key(env, codex_home)
-            record_glm_failure(
-                exc.detail,
-                key,
-                codex_home,
-                int(now.timestamp()) if now is not None else None,
-                base_url=executor.base_url,
-            )
-            if role in WRITER_ROLES and exc.may_have_mutated:
-                raise ChildFailure(
-                    "GLM child failed after possible workspace mutation; automatic writer fallback was suppressed. "
-                    + exc.detail,
-                    may_have_mutated=True,
-                ) from exc
-            fallback = _fallback_executor(role)
-            raw, _ = execute(fallback)
-            return raw, fallback, "glm_runtime_failure"
+    def run_planned_chain() -> tuple[str, ExecutorSpec]:
+        nonlocal fallback_stage, fallback_reason_code, receipt_format_error
+        last_failure: ChildFailure | None = None
+        for executor in plan.chain:
+            if len(attempts) >= MAX_MODEL_ATTEMPTS:
+                break
+            try:
+                prepared = execute(executor)
+            except DeadlineExhausted as exc:
+                # No time left to start this executor: it was never invoked, so
+                # it is not that provider's runtime failure, nothing is recorded
+                # against its health, and no further candidate is tried.
+                fallback_stage = "deadline"
+                fallback_reason_code = "shared_deadline_exhausted_before_fallback"
+                last_failure = exc
+                break
+            except ReceiptFormatFailure as exc:
+                receipt_format_error = exc.detail
+                fallback_stage = "receipt"
+                fallback_reason_code = f"{_executor_kind(executor)}_receipt_format_failure"
+                # The provider request itself completed; a bad receipt shape is a
+                # capability issue and must not open its health circuit.
+                record_provider_success(executor)
+                if role in WRITER_ROLES and exc.may_have_mutated:
+                    raise ChildFailure(
+                        f"{_executor_display(executor)} child completed after possible workspace mutation, but its "
+                        "receipt could not be normalized; automatic writer fallback was suppressed. " + exc.detail,
+                        may_have_mutated=True,
+                        usage=exc.usage,
+                        duration_ms=exc.duration_ms,
+                    ) from exc
+                last_failure = exc
+                continue
+            except ChildFailure as exc:
+                fallback_stage = "runtime"
+                fallback_reason_code = f"{_executor_kind(executor)}_runtime_failure"
+                record_provider_failure(executor, exc.detail)
+                if role in WRITER_ROLES and exc.may_have_mutated:
+                    raise ChildFailure(
+                        f"{_executor_display(executor)} child failed after possible workspace mutation; automatic "
+                        "writer fallback was suppressed. " + exc.detail,
+                        may_have_mutated=True,
+                        usage=exc.usage,
+                        duration_ms=exc.duration_ms,
+                    ) from exc
+                last_failure = exc
+                continue
+            record_provider_success(executor)
+            return prepared, executor
+        if last_failure is not None:
+            raise last_failure
+        raise ChildFailure("no executable provider remained in the planned chain")
 
-    if role in WRITER_ROLES:
-        with workspace_writer_lock(target_workspace):
-            raw, executor, actual_fallback_reason = execute_with_fallback()
-    else:
-        raw, executor, actual_fallback_reason = execute_with_fallback()
+    def build_router_meta(final_executor: ExecutorSpec | None) -> dict[str, Any]:
+        route_path_label = " → ".join(
+            str(item.get("model_label") or item.get("executor") or "?") for item in attempt_usage
+        )
+        return {
+            "role": role,
+            "model": final_executor.model if final_executor else None,
+            "provider": final_executor.provider if final_executor else None,
+            "reasoning_effort": final_executor.reasoning_effort if final_executor else None,
+            "executor": final_executor.id if final_executor else None,
+            "route_label": final_executor.route_label if final_executor else None,
+            "selected_executor": plan.chain[0].id,
+            "attempted_executors": attempts,
+            "final_executor": final_executor.id if final_executor else None,
+            "route_path": list(attempts),
+            "route_path_label": route_path_label,
+            "fallback_occurred": len(attempts) > 1,
+            "fallback_stage": fallback_stage,
+            "fallback_reason_code": fallback_reason_code,
+            # Compatibility alias: route_label-style consumers and older tooling read
+            # fallback_reason for the same final-provider semantics.
+            "fallback_reason": fallback_reason_code,
+            "selection_bypass_reason": selection_bypass_reason,
+            # Every provider skipped at selection time, not just the first one.
+            "selection_bypass_reasons": dict(selection_bypass_reasons),
+            "selection_reason": plan.selection_reason,
+            "requested_profile": profile,
+            "requested_light_profile": normalized_light,
+            "requested_luna_mode": normalized_luna,
+            "usage": usage_total,
+            "usage_stream_kind": (
+                attempt_usage[0]["usage_stream_kind"]
+                if attempt_usage and len({item["usage_stream_kind"] for item in attempt_usage}) == 1
+                else "mixed"
+            ),
+            "usage_counter_semantics": (
+                attempt_usage[0]["usage_counter_semantics"]
+                if attempt_usage and len({item["usage_counter_semantics"] for item in attempt_usage}) == 1
+                else "mixed"
+            ),
+            "usage_adapter_version": USAGE_ADAPTER_VERSION,
+            "attempt_usage": attempt_usage,
+            "duration_ms": duration_ms,
+            "receipt_normalizations": receipt_normalizations,
+            "receipt_format_error": receipt_format_error,
+            "receipt_mode": final_executor.receipt_mode if final_executor else None,
+        }
+
+    def execute_with_writer_lease() -> tuple[str, ExecutorSpec]:
+        if role in WRITER_ROLES:
+            with workspace_writer_lock(target_workspace):
+                return run_planned_chain()
+        return run_planned_chain()
+
+    try:
+        raw, final_executor = execute_with_writer_lease()
+    except ChildFailure as exc:
+        # Keep the complete fallback ledger even when every model failed, so
+        # the MCP failure result, session state, telemetry, and the status page
+        # describe the same route path a success would have shown.
+        failure_usage = dict(usage_total)
+        for stream_key in ("_stream_kind", "_counter_semantics", "_adapter_version"):
+            if stream_key in exc.usage:
+                failure_usage[stream_key] = exc.usage[stream_key]
+        raise RoutedTaskFailure(
+            str(exc),
+            router_meta=build_router_meta(None),
+            may_have_mutated=exc.may_have_mutated,
+            usage=failure_usage,
+            duration_ms=duration_ms,
+        ) from exc
     valid, errors, receipt = validate_receipt(raw)
     if not valid or receipt is None:
         raise RuntimeError("invalid child receipt: " + "; ".join(errors))
     if receipt.get("objective_id") != expected_objective_id:
         raise RuntimeError("invalid child receipt: objective_id does not match the routed decision")
-    receipt["_router_meta"] = {
-        "role": role,
-        "model": executor.model,
-        "provider": executor.provider,
-        "reasoning_effort": executor.reasoning_effort,
-        "executor": executor.id,
-        "route_label": executor.route_label,
-        "requested_profile": profile,
-        "requested_light_profile": normalized_light,
-        "selection_reason": resolution.reason,
-        "fallback_reason": actual_fallback_reason,
-        "attempted_executors": attempts,
-        "usage": usage_total,
-        "usage_stream_kind": (
-            attempt_usage[0]["usage_stream_kind"]
-            if attempt_usage and len({item["usage_stream_kind"] for item in attempt_usage}) == 1
-            else "mixed"
-        ),
-        "usage_counter_semantics": (
-            attempt_usage[0]["usage_counter_semantics"]
-            if attempt_usage and len({item["usage_counter_semantics"] for item in attempt_usage}) == 1
-            else "mixed"
-        ),
-        "usage_adapter_version": USAGE_ADAPTER_VERSION,
-        "attempt_usage": attempt_usage,
-        "duration_ms": duration_ms,
-        "receipt_normalizations": receipt_normalizations,
-        "receipt_format_error": receipt_format_error,
-        "receipt_mode": executor.receipt_mode,
-    }
+    receipt["_router_meta"] = build_router_meta(final_executor)
     return receipt
 
 
@@ -1018,6 +1112,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--profile", choices=sorted(EXECUTION_PROFILES), default=PROFILE_STABLE)
     parser.add_argument("--light-profile", choices=sorted(LIGHT_PROFILES), default=LIGHT_PROFILE_LUNA_STABLE)
+    parser.add_argument(
+        "--luna-mode",
+        choices=sorted(LUNA_MODES),
+        default=LUNA_DISABLED,
+        help="Luna must be enabled explicitly per session; default stays disabled",
+    )
     parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args()
     task = args.task if args.task is not None else __import__("sys").stdin.read()
@@ -1028,8 +1128,17 @@ def main() -> int:
             args.timeout,
             execution_profile=args.profile,
             light_profile=args.light_profile,
+            luna_mode=args.luna_mode,
             images=args.image,
         )
+    except RoutedTaskFailure as exc:
+        print(
+            json.dumps(
+                {"error": f"{type(exc).__name__}: {exc}", "_router_meta": exc.router_meta},
+                ensure_ascii=False,
+            )
+        )
+        return 1
     except Exception as exc:
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
         return 1

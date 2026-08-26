@@ -53,8 +53,18 @@ class ProviderPolicyTests(unittest.TestCase):
                 env={provider_policy.GLM_ENV_KEY: "test-key"},
                 home=tmp,
             )
-        self.assertEqual(result.executor.model, "gpt-5.6-luna")
-        self.assertEqual(result.reason, "luna_role")
+        self.assertEqual(result.executor.model, "gpt-5.6-terra")
+        self.assertEqual(result.reason, "glm_peak_window")
+        with tempfile.TemporaryDirectory() as tmp:
+            luna = provider_policy.resolve_executor(
+                "router_scout",
+                "GLM_FIRST",
+                luna_mode="LUNA_BOUNDED",
+                now=dt.datetime(2026, 8, 24, 15, 0, tzinfo=TZ),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                home=tmp,
+            )
+        self.assertEqual(luna.executor.model, "gpt-5.6-luna")
 
     def test_local_text_first_only_replaces_read_only_light_roles(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,22 +75,180 @@ class ProviderPolicyTests(unittest.TestCase):
                 env={"LOCAL_MODEL_API_KEY": "test-key"},
                 home=tmp,
             )
-            monitor = provider_policy.resolve_executor(
-                "router_monitor",
-                light_profile="LOCAL_TEXT_FIRST",
-                env={"LOCAL_MODEL_API_KEY": "test-key"},
-                home=tmp,
-            )
             tester = provider_policy.resolve_executor(
                 "router_tester",
                 light_profile="LOCAL_TEXT_FIRST",
                 env={"LOCAL_MODEL_API_KEY": "test-key"},
                 home=tmp,
             )
+            with self.assertRaises(ValueError):
+                provider_policy.resolve_executor(
+                    "router_monitor",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    env={"LOCAL_MODEL_API_KEY": "test-key"},
+                    home=tmp,
+                )
         self.assertEqual(scout.executor.id, "local_scout")
-        self.assertEqual(monitor.executor.id, "local_monitor")
         self.assertEqual(scout.executor.model, "deepseek-v4-flash")
-        self.assertEqual(tester.executor.id, "luna_tester")
+        # Local text never replaces writable light roles; with Luna disabled the
+        # tester chain starts at Terra.
+        self.assertEqual(tester.executor.id, "terra_tester")
+
+    def test_plain_text_routing_matrix_and_luna_opt_in(self):
+        off_peak = dt.datetime(2026, 8, 24, 10, 0, tzinfo=TZ)
+        peak = dt.datetime(2026, 8, 24, 15, 0, tzinfo=TZ)
+        glm_env = {provider_policy.GLM_ENV_KEY: "test-key"}
+
+        def chain_ids(role, *, execution_profile="STABLE", light_profile="LUNA_STABLE",
+                      luna_mode="LUNA_DISABLED", now=None, env=None, home=None, has_images=False):
+            plan = provider_policy.plan_executor_chain(
+                role,
+                execution_profile=execution_profile,
+                light_profile=light_profile,
+                luna_mode=luna_mode,
+                has_images=has_images,
+                now=now,
+                env=env,
+                home=home,
+            )
+            return [executor.id for executor in plan.chain]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            local_env = {"LOCAL_MODEL_API_KEY": "test-key"}
+
+            # Light lane, Luna disabled.
+            self.assertEqual(
+                chain_ids("router_scout", env=local_env, home=tmp),
+                ["terra_scout"],
+                "GLM off + Luna off -> Terra",
+            )
+            self.assertEqual(
+                chain_ids("router_scout", execution_profile="GLM_FIRST", now=off_peak,
+                          env={**glm_env, **local_env}, home=tmp),
+                ["glm_scout", "terra_scout"],
+                "GLM on + Local off + Luna off -> GLM then Terra",
+            )
+            self.assertEqual(
+                chain_ids("router_scout", light_profile="LOCAL_TEXT_FIRST",
+                          execution_profile="GLM_FIRST", now=off_peak,
+                          env={**glm_env, **local_env}, home=tmp),
+                ["local_scout", "glm_scout", "terra_scout"],
+                "full preference chain with Luna off is Local, GLM, Terra",
+            )
+            self.assertEqual(
+                chain_ids("router_scout", light_profile="LOCAL_TEXT_FIRST",
+                          execution_profile="GLM_FIRST", now=off_peak, luna_mode="LUNA_BOUNDED",
+                          env={**glm_env, **local_env}, home=tmp),
+                ["local_scout", "luna_scout", "glm_scout", "terra_scout"],
+                "full preference chain is ordered Local, Luna, GLM, Terra",
+            )
+            self.assertEqual(
+                chain_ids("router_scout", light_profile="LOCAL_TEXT_FIRST",
+                          env=local_env, home=tmp),
+                ["local_scout", "terra_scout"],
+                "Local on + Luna off + GLM off -> Local then Terra",
+            )
+
+            # Luna opt-in keeps Luna ahead of GLM for light roles only.
+            self.assertEqual(
+                chain_ids("router_scout", luna_mode="LUNA_BOUNDED", env=glm_env,
+                          now=off_peak, execution_profile="GLM_FIRST", home=tmp),
+                ["luna_scout", "glm_scout", "terra_scout"],
+            )
+            self.assertEqual(
+                chain_ids("router_tester", luna_mode="LUNA_BOUNDED", home=tmp),
+                ["luna_tester", "terra_tester"],
+            )
+            self.assertEqual(
+                chain_ids("router_docs", luna_mode="LUNA_BOUNDED", home=tmp),
+                ["luna_docs", "terra_docs"],
+            )
+
+            # Complex lane never uses Luna and forces Terra for images/peak.
+            self.assertEqual(
+                chain_ids("router_worker", luna_mode="LUNA_BOUNDED", home=tmp),
+                ["terra_worker"],
+            )
+            self.assertEqual(
+                chain_ids("router_worker", execution_profile="GLM_FIRST", now=off_peak,
+                          env=glm_env, home=tmp),
+                ["glm_worker", "terra_worker"],
+            )
+            self.assertEqual(
+                chain_ids("router_worker", execution_profile="GLM_FIRST", now=peak,
+                          env=glm_env, home=tmp),
+                ["terra_worker"],
+            )
+            self.assertEqual(
+                chain_ids("router_reviewer", execution_profile="GLM_FIRST", now=off_peak,
+                          env=glm_env, home=tmp, has_images=True),
+                ["terra_reviewer"],
+            )
+
+            # Luna disabled means no Luna executor anywhere in any chain.
+            for role in ("router_scout", "router_tester", "router_docs",
+                         "router_worker", "router_reviewer"):
+                for execution_profile in ("STABLE", "GLM_FIRST"):
+                    for light_profile in ("LUNA_STABLE", "LOCAL_TEXT_FIRST"):
+                        with self.subTest(role=role, profile=execution_profile, light=light_profile):
+                            ids = chain_ids(
+                                role,
+                                execution_profile=execution_profile,
+                                light_profile=light_profile,
+                                now=off_peak,
+                                env={**glm_env, **local_env},
+                                home=tmp,
+                            )
+                            self.assertFalse(
+                                any(executor_id.startswith("luna_") for executor_id in ids)
+                            )
+            # The monitor lane has no model executor at all, in any mode.
+            self.assertNotIn("luna_monitor", provider_policy.EXECUTORS)
+            for luna_mode in ("LUNA_DISABLED", "LUNA_BOUNDED"):
+                with self.subTest(monitor_luna_mode=luna_mode):
+                    with self.assertRaises(ValueError):
+                        provider_policy.plan_executor_chain(
+                            "router_monitor", luna_mode=luna_mode, env=local_env, home=tmp
+                        )
+
+            # GLM executors keep the established max reasoning effort.
+            for executor_id in ("glm_scout", "glm_tester", "glm_docs", "glm_worker", "glm_reviewer"):
+                with self.subTest(executor=executor_id):
+                    self.assertEqual(provider_policy.EXECUTORS[executor_id].reasoning_effort, "max")
+
+            # Selection bypass distinguishes not-attempted from fallback.
+            bypassed = provider_policy.plan_executor_chain(
+                "router_scout",
+                light_profile="LOCAL_TEXT_FIRST",
+                env=local_env,
+                home=tmp,
+                execution_profile="GLM_FIRST",
+                now=peak,
+            )
+            self.assertEqual(bypassed.bypass.get("glm"), "glm_peak_window")
+            missing = provider_policy.plan_executor_chain(
+                "router_scout", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
+            )
+            self.assertEqual(missing.bypass.get("local"), "local_key_missing")
+            self.assertEqual(missing.selection_reason, "local_key_missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = provider_policy.plan_executor_chain(
+                "router_scout", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
+            )
+            self.assertEqual(absent.bypass.get("local"), "local_config_missing")
+            self.assertEqual(absent.selection_reason, "local_config_missing")
+
+    def test_images_never_reach_text_only_providers(self):
+        plan = provider_policy.plan_executor_chain(
+            "router_worker",
+            execution_profile="GLM_FIRST",
+            has_images=True,
+            env={provider_policy.GLM_ENV_KEY: "test-key"},
+            now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=TZ),
+        )
+        self.assertEqual([executor.id for executor in plan.chain], ["terra_worker"])
+        self.assertEqual(plan.bypass.get("glm"), "multimodal_requires_terra")
 
     def test_heavy_and_light_profiles_are_orthogonal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,19 +276,27 @@ class ProviderPolicyTests(unittest.TestCase):
         self.assertEqual(scout.executor.id, "local_scout")
         self.assertEqual(worker.executor.id, "glm_worker")
 
-    def test_local_provider_missing_key_or_config_falls_back_to_luna(self):
+    def test_local_provider_missing_key_or_config_falls_back_to_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing_config = provider_policy.resolve_executor(
                 "router_scout", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
             )
-            self.assertEqual(missing_config.executor.id, "luna_scout")
+            self.assertEqual(missing_config.executor.id, "terra_scout")
             self.assertEqual(missing_config.reason, "local_config_missing")
             self.local_config(tmp)
             missing_key = provider_policy.resolve_executor(
                 "router_scout", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
             )
-            self.assertEqual(missing_key.executor.id, "luna_scout")
+            self.assertEqual(missing_key.executor.id, "terra_scout")
             self.assertEqual(missing_key.reason, "local_key_missing")
+            with_luna = provider_policy.resolve_executor(
+                "router_scout",
+                light_profile="LOCAL_TEXT_FIRST",
+                luna_mode="LUNA_BOUNDED",
+                env={},
+                home=tmp,
+            )
+            self.assertEqual(with_luna.executor.id, "luna_scout")
 
     def test_local_provider_config_validation_rejects_injection_and_public_http(self):
         valid = {
@@ -225,7 +401,7 @@ class ProviderPolicyTests(unittest.TestCase):
                 env={"LOCAL_MODEL_API_KEY": "local-key"},
                 home=tmp,
             )
-            self.assertEqual(result.executor.id, "luna_scout")
+            self.assertEqual(result.executor.id, "terra_scout")
             self.assertTrue(result.reason.startswith("local_"))
             self.assertEqual(provider_policy.read_health(tmp)["state"], "closed")
 

@@ -17,6 +17,8 @@ sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 from provider_policy import (  # noqa: E402
     LIGHT_PROFILE_LOCAL_TEXT_FIRST,
     LIGHT_PROFILE_LUNA_STABLE,
+    LUNA_BOUNDED,
+    LUNA_DISABLED,
     PROFILE_GLM_FIRST,
     PROFILE_STABLE,
     glm_key,
@@ -41,12 +43,14 @@ from router_core import (  # noqa: E402
     load_state,
     parse_control,
     prompt_digest,
+    recommended_executor_label,
     routing_context,
     save_state,
     session_state_lock,
     set_execution_profile,
     set_economics_policy,
     set_light_profile,
+    set_luna_mode,
     set_mode,
     validate_receipt,
     writer_lock_held,
@@ -97,31 +101,113 @@ def session_id(payload: dict[str, Any]) -> str:
     return str(value) if value else "unknown-session"
 
 
+SELECTION_BYPASS_SHORT_REASONS = {
+    "local_config_missing": "配置缺失",
+    "local_key_missing": "Key 未配置",
+    "local_config_key_missing": "Key 未配置",
+    "local_config_unsafe_permissions": "配置文件权限异常",
+    "local_config_unsafe_file_type": "配置文件类型异常",
+    "local_config_unreadable": "配置不可读",
+    "local_config_model_catalog_missing": "模型目录缺失",
+    "local_config_model_catalog_invalid": "模型目录非法",
+    "local_config_model_catalog_mismatch": "模型目录不一致",
+    "local_circuit_open": "熔断",
+    "local_runtime_failure": "熔断（运行失败）",
+    "local_authentication": "熔断（鉴权）",
+    "local_probe_in_progress": "半开探针进行中",
+    "invalid_policy": "policy 非法",
+    "glm_invalid_policy": "policy 非法",
+    "glm_peak_window": "高峰时段",
+    "glm_key_missing": "Key 未配置",
+    "glm_circuit_open": "熔断",
+    "glm_quota_5h": "额度熔断（5 小时）",
+    "glm_quota_7d": "额度熔断（7 天）",
+    "glm_authentication": "鉴权熔断",
+    "glm_subscription": "订阅异常",
+    "glm_probe_in_progress": "半开探针进行中",
+    "multimodal_requires_terra": "多模态需 Terra",
+}
+
+
+def _bypass_provider_label(code: str) -> str:
+    return "Local" if code.startswith("local") else "GLM"
+
+
+def _bypass_entry(code: Any) -> str:
+    text = str(code or "")
+    reason = SELECTION_BYPASS_SHORT_REASONS.get(text, text or "未知原因")
+    return f"{_bypass_provider_label(text)} {reason}"
+
+
+def _bypass_notes_text(last_execution: dict[str, Any]) -> str | None:
+    plural = last_execution.get("selection_bypass_reasons")
+    if isinstance(plural, dict) and plural:
+        # State persistence sorts keys alphabetically; render in chain-priority
+        # order (Local before GLM) regardless of insertion or storage order.
+        priority = {"local": 0, "glm": 1}
+        codes = [code for _, code in sorted(plural.items(), key=lambda item: priority.get(item[0], 2))]
+    elif last_execution.get("selection_bypass_reason"):
+        codes = [last_execution["selection_bypass_reason"]]
+    else:
+        return None
+    return "；".join(_bypass_entry(code) for code in codes)
+
+
+def last_execution_text(last_execution: Any) -> str:
+    if not isinstance(last_execution, dict):
+        return "本会话尚无实际委派"
+    outcome = "成功" if last_execution.get("outcome") == "completed" else "失败"
+    path_label = str(
+        last_execution.get("route_path_label")
+        or last_execution.get("route_label")
+        or ROLE_LABELS.get(str(last_execution.get("role")), "未知角色")
+    )
+    parts = [f"最近实际执行：{path_label}（{outcome}）"]
+    bypass = _bypass_notes_text(last_execution)
+    if bypass:
+        parts.append(f"未尝试：{bypass}")
+    reason_code = last_execution.get("fallback_reason_code")
+    if reason_code:
+        if last_execution.get("fallback_stage") == "deadline":
+            parts.append(f"回退未启动原因：{reason_code}")
+        elif last_execution.get("fallback_occurred"):
+            parts.append(f"回退原因：{reason_code}")
+        elif outcome == "失败":
+            parts.append(f"失败原因：{reason_code}")
+    for attempt in (last_execution.get("attempt_usage") or [])[:2]:
+        label = str(attempt.get("model_label") or attempt.get("executor") or "?")
+        state = "成功" if attempt.get("outcome") == "completed" else "失败"
+        usage = attempt.get("usage") or {}
+        seconds = round(int(attempt.get("duration_ms") or 0) / 1000, 1)
+        parts.append(
+            f"{label}：{state}｜{seconds}s｜input {int(usage.get('input_tokens') or 0)}｜output {int(usage.get('output_tokens') or 0)}"
+        )
+    return "｜".join(parts)
+
+
 def status_text(state: dict[str, Any]) -> str:
     last = state.get("last_decision")
     profile = str(state.get("execution_profile") or PROFILE_STABLE)
     light_profile = str(state.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE)
+    luna_mode = str(state.get("luna_mode") or LUNA_DISABLED)
     economics_policy = str(state.get("economics_policy") or DEFAULT_ECONOMICS_POLICY)
     if isinstance(last, dict):
         last_role = str(last.get("role") or "")
         if last.get("decision") == "TOOL_ONLY":
             last_text = "确定性工具 fast path"
-        elif profile == PROFILE_GLM_FIRST and last_role in {"router_worker", "router_reviewer"}:
-            last_text = "GLM-5.3 Max / Terra 动态执行"
-        elif light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and last_role == "router_scout":
-            config, _ = load_local_config()
-            last_text = f"{config.display_name if config else 'Local Text'} / Luna 动态执行"
+        elif last.get("decision") == "DELEGATE":
+            last_text = recommended_executor_label(last_role, profile, light_profile, luna_mode)
         else:
-            last_text = ROLE_LABELS.get(last_role, "Sol")
+            last_text = "Sol"
     else:
         last_text = "暂无"
     _, installed, wrapper_ready, parked = environment_details()
     ready = installed == len(ROLES) and wrapper_ready and not parked
     mode_labels = {"OFF": "已关闭", "SHADOW": "影子模式", "ON": "已开启"}
     profile_text = "GLM_FIRST" if profile == PROFILE_GLM_FIRST else "STABLE"
-    light_profile_text = (
-        "LOCAL_TEXT_FIRST" if light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST else "LUNA_STABLE"
-    )
+    # LUNA_STABLE is an internal legacy enum name for "Local not preferred";
+    # the user-facing label must not suggest Luna is enabled.
+    light_profile_text = "开启" if light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST else "关闭"
     if ready:
         environment = "就绪"
     elif parked:
@@ -131,14 +217,12 @@ def status_text(state: dict[str, Any]) -> str:
     counts = state.get("execution_counts") or {}
     completed = int(counts.get("completed", 0))
     failed = int(counts.get("failed", 0))
-    last_execution = state.get("last_execution")
-    if isinstance(last_execution, dict):
-        outcome = "成功" if last_execution.get("outcome") == "completed" else "失败"
-        label = str(last_execution.get("route_label") or ROLE_LABELS.get(str(last_execution.get("role")), "未知角色"))
-        actual = f"最近实际执行：{label}（{outcome}）"
-    else:
-        actual = "本会话尚无实际委派"
+    actual = last_execution_text(state.get("last_execution"))
     writer = "忙碌" if isinstance(state.get("active_writer"), dict) else "空闲"
+    if luna_mode == LUNA_BOUNDED:
+        luna_status = "Luna 已开启（仅低风险 bounded 轻任务，复杂/多模态仍走 GLM/Terra/Sol）"
+    else:
+        luna_status = "Luna 已关闭（默认；$router-control luna 开启 后仅承接 bounded 轻任务）"
     if profile == PROFILE_GLM_FIRST:
         health = read_health()
         if not glm_key():
@@ -152,20 +236,20 @@ def status_text(state: dict[str, Any]) -> str:
     if light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST:
         local_config, local_reason = load_local_config()
         if local_config is None:
-            local_status = f"本地文本模型未就绪（{local_reason}），将用 Luna"
+            local_status = f"本地文本模型未就绪（{local_reason}），scout 改用后备链"
         elif local_config.env_key and not local_provider_key(local_config):
-            local_status = f"{local_config.display_name} Key 未配置，将用 Luna"
+            local_status = f"{local_config.display_name} Key 未配置，scout 改用后备链"
         else:
             local_health = read_local_health()
             if local_health.get("state") == "closed":
                 local_status = f"{local_config.display_name} 可用（只读轻任务）"
             else:
-                local_status = f"{local_config.display_name} 熔断，将用 Luna"
+                local_status = f"{local_config.display_name} 熔断，scout 改用后备链"
     else:
         local_status = "本地文本模型未启用"
     return (
-        f"智能路由：{mode_labels[state['mode']]}（仅当前会话）｜重任务：{profile_text}｜轻任务：{light_profile_text}｜"
-        f"经济门：{economics_policy}｜"
+        f"智能路由：{mode_labels[state['mode']]}（仅当前会话）｜重任务：{profile_text}｜Local：{light_profile_text}｜"
+        f"经济门：{economics_policy}｜{luna_status}｜"
         f"{glm_status}｜{local_status}｜环境：{environment}｜"
         f"最近建议：{last_text}｜{actual}｜累计实际执行：成功 {completed}，失败 {failed}｜写入槽：{writer}。"
     )
@@ -202,7 +286,10 @@ def on_session_start(payload: dict[str, Any]) -> None:
             f'SMART_ROUTER_SETUP: 环境尚未就绪。仅在合适时提醒用户运行 python3 "{command}" --apply；不要自动安装。',
         )
     elif state["mode"] != "OFF":
-        hook_context("SessionStart", f"SR_SESSION mode={state['mode']} restored for this session.")
+        hook_context(
+            "SessionStart",
+            f"SR_SESSION mode={state['mode']} luna={state['luna_mode']} restored for this session.",
+        )
 
 
 def on_user_prompt(payload: dict[str, Any]) -> None:
@@ -229,8 +316,12 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
                     "session": state["session_key"][:12],
                 },
             )
-    if action in {"ON", "SHADOW", "OFF", "GLM_ON", "GLM_OFF", "LOCAL_ON", "LOCAL_OFF", "ECON_V1", "ECON_V2"}:
-        if action in {"ON", "GLM_ON", "LOCAL_ON"}:
+    if action in {
+        "ON", "SHADOW", "OFF",
+        "GLM_ON", "GLM_OFF", "LOCAL_ON", "LOCAL_OFF", "LUNA_ON", "LUNA_OFF",
+        "ECON_V1", "ECON_V2",
+    }:
+        if action in {"ON", "GLM_ON", "LOCAL_ON", "LUNA_ON"}:
             _, installed, wrapper_ready, parked = environment_details()
             command = PLUGIN_ROOT / "scripts" / "install_agents.py"
             if parked:
@@ -249,6 +340,10 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
             state = set_light_profile(root, sid, LIGHT_PROFILE_LOCAL_TEXT_FIRST, activate=True)
         elif action == "LOCAL_OFF":
             state = set_light_profile(root, sid, LIGHT_PROFILE_LUNA_STABLE)
+        elif action == "LUNA_ON":
+            state = set_luna_mode(root, sid, LUNA_BOUNDED, activate=True)
+        elif action == "LUNA_OFF":
+            state = set_luna_mode(root, sid, LUNA_DISABLED)
         elif action == "ECON_V1":
             state = set_economics_policy(root, sid, "V1_COMPAT")
         elif action == "ECON_V2":
@@ -262,18 +357,21 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
                 "mode": state["mode"],
                 "execution_profile": state["execution_profile"],
                 "light_profile": state["light_profile"],
+                "luna_mode": state["luna_mode"],
                 "economics_policy": state["economics_policy"],
                 "session": state["session_key"][:12],
             },
         )
         replies = {
-            "ON": "已开启智能路由（仅当前会话）。当前保留原执行配置；边界清晰且适合委派的轻任务交给 Luna，高风险或不确定任务仍由 Sol 处理。",
+            "ON": "已开启智能路由（仅当前会话）。Luna 默认关闭；边界清晰且适合委派的轻任务按 Local/GLM/Terra 后备链执行，高风险或不确定任务仍由 Sol 处理。",
             "SHADOW": "已开启影子模式（仅当前会话）。后续只显示路由预览，不会实际委派。",
             "OFF": "已关闭智能路由（仅当前会话）。后续任务全部由 Sol 处理。",
-            "GLM_ON": "已开启 GLM_FIRST 智能路由（仅当前会话）。Luna 处理轻任务；复杂纯文本任务优先 GLM-5.3 Max；工作日 14:00–18:00、额度熔断或多模态时自动改用 Terra。",
+            "GLM_ON": "已开启 GLM_FIRST 智能路由（仅当前会话）。复杂纯文本 worker/reviewer 优先 GLM-5.3 Max；Luna 关闭时轻任务也可按链使用 GLM；工作日 14:00–18:00、额度熔断或多模态时自动改用 Terra。",
             "GLM_OFF": "已关闭当前会话的 GLM_FIRST，恢复 STABLE 执行配置；智能路由的 ON/OFF 状态不变。",
-            "LOCAL_ON": "已开启 LOCAL_TEXT_FIRST（仅当前会话）。批量只读侦察优先使用已配置的本地文本模型，失败或不可用时自动回退 Luna；测试和文档仍由 Luna 处理，等待任务始终使用无模型的确定性长等待。",
-            "LOCAL_OFF": "已关闭当前会话的 LOCAL_TEXT_FIRST，恢复 LUNA_STABLE；智能路由的 ON/OFF 状态不变。",
+            "LOCAL_ON": "已开启本地文本首选 LOCAL_TEXT_FIRST（仅当前会话）。批量只读侦察优先使用已配置的本地文本模型，失败或不可用时按后备链改用其他执行器；等待任务始终使用无模型的确定性长等待。",
+            "LOCAL_OFF": "已关闭本地文本首选（仅当前会话）；智能路由的 ON/OFF 状态不变。Luna 开关不受影响。",
+            "LUNA_ON": "已开启 Luna 并启用智能路由（仅当前会话）。Luna 仅承接低风险、边界明确的 scout/tester/docs 轻任务；架构设计、复杂跨模块归因、安全审查、生产决策、高风险写入和多模态审查仍由 Sol/Terra 处理。",
+            "LUNA_OFF": "已关闭 Luna（仅当前会话）；智能路由的 ON/OFF 状态不变。Luna 不再作为首选或隐藏回退执行器。",
             "ECON_V1": "已切换为 V1_COMPAT 兼容经济门；恢复 v0.4.1 的 work_units 路由行为，ON/OFF 状态不变。",
             "ECON_V2": "已切换为 V2_STATIC 保守经济门；微任务和确定性查询不启动子模型，只有足够大的独立工作包才委派，ON/OFF 状态不变。",
         }
@@ -282,7 +380,8 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
     if action in {"STATUS", "HELP"}:
         if action == "HELP":
             reply = (
-                "当前会话可用命令：$router-control 开启、glm 开启、glm 关闭、local 开启、local 关闭、影子模式、关闭、状态。"
+                "当前会话可用命令：$router-control 开启、glm 开启、glm 关闭、local 开启、local 关闭、"
+                "luna 开启、luna 关闭、影子模式、关闭、状态。"
                 "经济策略 v2 使用保守门，经济策略 v1 恢复兼容门；开启后自动判断；影子模式只预览；全局关闭请使用 /plugins。"
             )
         else:
@@ -317,12 +416,13 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
         {
             "event": "route_decision",
             "telemetry_schema_version": 2,
-            "policy_version": "v0.4.2-alpha",
+            "policy_version": "v0.4.3-alpha",
             "mode": state["mode"],
             "decision": decision["decision"],
             "role": decision.get("role"),
             "execution_profile": state["execution_profile"],
             "light_profile": state["light_profile"],
+            "luna_mode": state["luna_mode"],
             "economics_policy": state["economics_policy"],
             "risk": decision["risk"],
             "reason_codes": decision["reason_codes"],
@@ -344,7 +444,13 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
     )
     hook_context(
         "UserPromptSubmit",
-        routing_context(state["mode"], decision, state["execution_profile"], state["light_profile"]),
+        routing_context(
+            state["mode"],
+            decision,
+            state["execution_profile"],
+            state["light_profile"],
+            state["luna_mode"],
+        ),
     )
 
 
@@ -470,43 +576,69 @@ def on_pre_tool(payload: dict[str, Any]) -> None:
         )
         return
     if is_native_agent:
+        # Router ON denies every native subagent (explorer/worker/reviewer and
+        # external plugin agents): a native child inherits Sol, bypasses
+        # route_task, receipt v2, the single-slot lease, and provider telemetry.
+        # Nothing here claims the delegation slot or synthesizes write leases.
         root = data_root()
         sid = session_id(payload)
         state = load_state(root, sid)
         if state["mode"] != "ON":
             return
         decision = state.get("last_decision") or {}
-        if decision.get("decision") == "TOOL_ONLY":
-            deny_pretool(
-                "This objective is a deterministic TOOL_ONLY fast path; use the minimum direct tool call, not a child agent."
-            )
-            return
-        if decision.get("decision") != "DELEGATE":
-            return
-        delegation = state.get("current_delegation") or {}
-        claimed, reason, state = _claim_delegation(
-            root,
-            sid,
-            decision_id=str(decision.get("decision_id") or ""),
-            lease_id=str(decision.get("lease_id") or delegation.get("lease_id") or ""),
-            role=role,
-            source="external_native_agent",
-            tool_use_id=str(payload.get("tool_use_id") or ""),
-            task_digest=delegation_task_digest(tool_name, tool_input),
-            require_role_match=False,
+        decision_state = str(decision.get("decision") or "")
+        inline_reason = (
+            "Smart Router is ON without a usable DELEGATE decision (for example automatic Goal continuation, "
+            "which does not raise UserPromptSubmit); native subagents are denied. Handle this work inline in Sol. "
+            "If you truly need a native subagent, turn Smart Router off first."
         )
-        if not claimed:
-            deny_pretool("This objective already used its single delegation slot; integrate the existing receipt instead.")
-            return
+        if decision_state == "DELEGATE":
+            delegation = state.get("current_delegation") or {}
+            slot_state = ""
+            if (
+                delegation.get("decision_id") == decision.get("decision_id")
+                and delegation.get("lease_id") == decision.get("lease_id")
+            ):
+                slot_state = str(delegation.get("status") or "")
+            if slot_state == "available":
+                reason = (
+                    "Smart Router is ON and this objective holds an unconsumed DELEGATE decision; native subagents "
+                    "are denied. Call synchronous smart_router.route_task once with the current decision_id and "
+                    "lease_id instead."
+                )
+            elif slot_state in {"started", "running"}:
+                reason = (
+                    "A synchronous routed task is already running for this objective; wait for its receipt to "
+                    "resume this Sol turn. Do not spawn a native agent or replay the consumed lease."
+                )
+            elif slot_state in {"completed", "failed"}:
+                reason = (
+                    "This objective's single delegation already finished; integrate the existing receipt instead "
+                    "of delegating or spawning again."
+                )
+            else:
+                reason = inline_reason
+        elif decision_state == "TOOL_ONLY":
+            reason = (
+                "This objective is a deterministic TOOL_ONLY fast path; use the minimum direct tool call in Sol, "
+                "not a child agent."
+            )
+        else:
+            # Covers INLINE_SOL and restored sessions with no last_decision,
+            # including automatic Goal continuation: Codex raises no
+            # UserPromptSubmit for it, so no fresh decision or lease exists and
+            # an old lease must never be reused.
+            reason = inline_reason
         append_telemetry(
             root,
             {
-                "event": "external_delegation_consumed_budget",
+                "event": "native_spawn_denied",
                 "role": role,
-                "decision_id": str(decision.get("decision_id") or "")[:12],
+                "decision": decision_state or None,
                 "session": state["session_key"][:12],
             },
         )
+        deny_pretool(reason)
         return
     if role not in ROLES:
         deny_pretool(f"Smart Router refused unknown agent role: {role}")
@@ -548,6 +680,10 @@ def on_pre_tool(payload: dict[str, Any]) -> None:
     ).upper()
     if is_wrapper and requested_light_profile != state.get("light_profile", LIGHT_PROFILE_LUNA_STABLE):
         deny_pretool("Requested light profile does not match the current session light profile.")
+        return
+    requested_luna_mode = str(tool_input.get("luna_mode") or LUNA_DISABLED).upper()
+    if is_wrapper and requested_luna_mode != state.get("luna_mode", LUNA_DISABLED):
+        deny_pretool("Requested luna mode does not match the current session luna mode.")
         return
     if (
         not is_wrapper
@@ -652,8 +788,19 @@ def on_post_tool(payload: dict[str, Any]) -> None:
         "model": receipt_meta.get("model"),
         "route_label": receipt_meta.get("route_label"),
         "provider": receipt_meta.get("provider"),
+        "selected_executor": receipt_meta.get("selected_executor"),
+        "attempted_executors": receipt_meta.get("attempted_executors"),
+        "final_executor": receipt_meta.get("final_executor"),
+        "route_path": receipt_meta.get("route_path"),
+        "route_path_label": receipt_meta.get("route_path_label"),
+        "fallback_occurred": receipt_meta.get("fallback_occurred"),
+        "fallback_stage": receipt_meta.get("fallback_stage"),
+        "fallback_reason_code": receipt_meta.get("fallback_reason_code"),
         "fallback_reason": receipt_meta.get("fallback_reason"),
+        "selection_bypass_reason": receipt_meta.get("selection_bypass_reason"),
+        "selection_bypass_reasons": receipt_meta.get("selection_bypass_reasons"),
         "usage": receipt_meta.get("usage"),
+        "attempt_usage": receipt_meta.get("attempt_usage"),
         "duration_ms": receipt_meta.get("duration_ms"),
     }
     state["recent_execution_keys"] = [*recent, execution_key][-128:]
@@ -680,6 +827,16 @@ def on_post_tool(payload: dict[str, Any]) -> None:
             "receipt_status": receipt_status,
             "writer_released": released,
             "decision_id": str(tool_input.get("decision_id") or "")[:12],
+            "selected_executor": receipt_meta.get("selected_executor"),
+            "attempted_executors": receipt_meta.get("attempted_executors"),
+            "final_executor": receipt_meta.get("final_executor"),
+            "route_path": receipt_meta.get("route_path"),
+            "route_path_label": receipt_meta.get("route_path_label"),
+            "fallback_occurred": receipt_meta.get("fallback_occurred"),
+            "fallback_stage": receipt_meta.get("fallback_stage"),
+            "fallback_reason_code": receipt_meta.get("fallback_reason_code"),
+            "selection_bypass_reason": receipt_meta.get("selection_bypass_reason"),
+            "selection_bypass_reasons": receipt_meta.get("selection_bypass_reasons"),
             "usage": receipt_meta.get("usage"),
             "usage_stream_kind": receipt_meta.get("usage_stream_kind"),
             "usage_counter_semantics": receipt_meta.get("usage_counter_semantics"),

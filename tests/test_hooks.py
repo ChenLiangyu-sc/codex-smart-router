@@ -148,7 +148,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("router_scout", context)
         status = self.prompt("$router-control 状态")
         self.assertIn("智能路由：已开启", status["hookSpecificOutput"]["additionalContext"])
-        self.assertIn("最近建议：Luna · 只读侦察", status["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("最近建议：Terra · 只读侦察", status["hookSpecificOutput"]["additionalContext"])
 
     def test_economics_policy_switch_is_session_scoped_and_reversible(self):
         self.prompt("$router-control 开启")
@@ -321,14 +321,19 @@ class HookTests(unittest.TestCase):
             )
         )
         status = self.call("user-prompt-submit", {"prompt": "$router-control 状态"}, env)
-        self.assertIn("轻任务：LOCAL_TEXT_FIRST", status["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("Local：开启", status["hookSpecificOutput"]["additionalContext"])
         self.assertIn("GLM-5.3 surrogate 可用", status["hookSpecificOutput"]["additionalContext"])
 
         disabled = self.call("user-prompt-submit", {"prompt": "$router-control local 关闭"}, env)
-        self.assertIn("LUNA_STABLE", disabled["hookSpecificOutput"]["additionalContext"])
+        disabled_text = disabled["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("已关闭本地文本首选", disabled_text)
+        self.assertNotIn("LUNA_STABLE", disabled_text, "user-facing replies must not show the internal enum")
         state = router_core.load_state(self.data, self.session)
         self.assertEqual(state["mode"], "ON")
         self.assertEqual(state["light_profile"], "LUNA_STABLE")
+        off_status = self.call("user-prompt-submit", {"prompt": "$router-control 状态"}, env)
+        self.assertIn("Local：关闭", off_status["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("Luna 已关闭", off_status["hookSpecificOutput"]["additionalContext"])
 
     def test_glm_profile_keeps_luna_for_light_roles_and_rejects_images(self):
         ready_home = self.ready_home("glm-luna-home")
@@ -386,7 +391,7 @@ class HookTests(unittest.TestCase):
         result = self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("SR_SHADOW", context)
-        self.assertIn("路由预览：Luna · 只读侦察", context)
+        self.assertIn("路由预览：Terra · 只读侦察", context)
 
     def test_high_risk_stays_sol_when_on(self):
         self.prompt("/router on")
@@ -406,7 +411,7 @@ class HookTests(unittest.TestCase):
         }
         self.assertIsNone(self.call("post-tool-use", call))
         status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("最近实际执行：Luna · 只读侦察（成功）", status)
+        self.assertIn("最近实际执行：只读侦察（成功）", status)
         self.assertIn("累计实际执行：成功 1，失败 0", status)
         # Duplicate runtime events must not inflate the user's execution count.
         self.assertIsNone(self.call("post-tool-use", call))
@@ -418,6 +423,155 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(self.call("post-tool-use", call))
         status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("累计实际执行：成功 2，失败 0", status)
+
+    def test_posttool_full_fallback_chain_is_visible_in_state_telemetry_and_status(self):
+        self.prompt("/router on")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+        meta = {
+            "role": "router_scout",
+            "model": "glm-5.3",
+            "provider": "zhipu_glm_coding",
+            "route_label": "GLM-5.3 · 只读侦察",
+            "selected_executor": "local_scout",
+            "attempted_executors": ["local_scout", "glm_scout"],
+            "final_executor": "glm_scout",
+            "route_path": ["local_scout", "glm_scout"],
+            "route_path_label": "Local Text Test → GLM-5.3",
+            "fallback_occurred": True,
+            "fallback_stage": "receipt",
+            "fallback_reason_code": "local_receipt_format_failure",
+            "fallback_reason": "local_receipt_format_failure",
+            "selection_bypass_reason": None,
+            "usage": {"input_tokens": 210, "output_tokens": 50},
+            "attempt_usage": [
+                {
+                    "executor": "local_scout",
+                    "model_label": "Local Text Test",
+                    "outcome": "receipt_format_failure",
+                    "usage": {"input_tokens": 120, "output_tokens": 30},
+                    "duration_ms": 22100,
+                },
+                {
+                    "executor": "glm_scout",
+                    "model_label": "GLM-5.3",
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 90, "output_tokens": 20},
+                    "duration_ms": 15700,
+                },
+            ],
+            "duration_ms": 37800,
+        }
+        call = {
+            "tool_name": "mcp__smart_router__route_task",
+            "tool_use_id": "mcp-chain-1",
+            "tool_input": {"role": "router_scout", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
+            "tool_response": {"isError": False, "structuredContent": {"status": "completed", "_router_meta": meta}},
+        }
+        self.assertIsNone(self.call("post-tool-use", call))
+        state = router_core.load_state(self.data, self.session)
+        last = state["last_execution"]
+        self.assertEqual(last["route_path"], ["local_scout", "glm_scout"])
+        self.assertEqual(last["route_path_label"], "Local Text Test → GLM-5.3")
+        self.assertEqual(last["final_executor"], "glm_scout")
+        self.assertTrue(last["fallback_occurred"])
+        self.assertEqual(last["fallback_stage"], "receipt")
+        self.assertEqual(last["fallback_reason_code"], "local_receipt_format_failure")
+        self.assertIsNone(last["selection_bypass_reason"])
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("最近实际执行：Local Text Test → GLM-5.3（成功）", status)
+        self.assertIn("回退原因：local_receipt_format_failure", status)
+        self.assertIn("Local Text Test：失败｜22.1s｜input 120｜output 30", status)
+        self.assertIn("GLM-5.3：成功｜15.7s｜input 90｜output 20", status)
+        telemetry = (self.data / "telemetry.jsonl").read_text(encoding="utf-8")
+        self.assertIn("route_execution_finished", telemetry)
+        self.assertIn("Local Text Test → GLM-5.3", telemetry)
+        self.assertIn("local_receipt_format_failure", telemetry)
+
+    def test_posttool_selection_bypass_note_in_status(self):
+        self.prompt("/router on")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+        meta = {
+            "role": "router_scout",
+            "route_label": "GLM-5.3 · 只读侦察",
+            "selected_executor": "glm_scout",
+            "attempted_executors": ["glm_scout"],
+            "final_executor": "glm_scout",
+            "route_path": ["glm_scout"],
+            "route_path_label": "GLM-5.3",
+            "fallback_occurred": False,
+            "fallback_stage": "selection",
+            "fallback_reason_code": "local_config_missing",
+            "fallback_reason": "local_config_missing",
+            "selection_bypass_reason": "local_config_missing",
+            "usage": {"input_tokens": 90, "output_tokens": 20},
+            "attempt_usage": [
+                {
+                    "executor": "glm_scout",
+                    "model_label": "GLM-5.3",
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 90, "output_tokens": 20},
+                    "duration_ms": 15700,
+                }
+            ],
+            "duration_ms": 15700,
+        }
+        call = {
+            "tool_name": "mcp__smart_router__route_task",
+            "tool_use_id": "mcp-bypass-1",
+            "tool_input": {"role": "router_scout", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
+            "tool_response": {"isError": False, "structuredContent": {"status": "completed", "_router_meta": meta}},
+        }
+        self.assertIsNone(self.call("post-tool-use", call))
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("最近实际执行：GLM-5.3（成功）", status)
+        self.assertIn("未尝试：Local 配置缺失", status)
+
+    def test_luna_control_commands_are_session_scoped(self):
+        enabled = self.prompt("$router-control luna 开启")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("已开启 Luna", enabled)
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["luna_mode"], "LUNA_BOUNDED")
+        self.assertEqual(state["mode"], "ON")
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Luna 已开启", status)
+
+        off = self.prompt("$router-control luna 关闭")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("已关闭 Luna", off)
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["luna_mode"], "LUNA_DISABLED")
+        self.assertEqual(state["mode"], "ON", "luna off must not change router ON/OFF")
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Luna 已关闭", status)
+
+    def test_wrapper_luna_mode_must_match_session(self):
+        self.prompt("$router-control luna 开启")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+        mismatch = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_use_id": "luna-mismatch-1",
+                "tool_input": {
+                    "role": "router_scout",
+                    "task": "批量盘点所有日志和 manifest",
+                    "luna_mode": "LUNA_DISABLED",
+                },
+            },
+        )
+        self.assertIn("luna mode", mismatch["hookSpecificOutput"]["permissionDecisionReason"])
+        allowed = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_use_id": "luna-match-1",
+                "tool_input": {
+                    "role": "router_scout",
+                    "task": "批量盘点所有日志和 manifest",
+                    "luna_mode": "LUNA_BOUNDED",
+                },
+            },
+        )
+        self.assertIsNone(allowed)
 
     def test_blocked_receipt_counts_as_failed_actual_execution(self):
         self.prompt("/router on")
@@ -433,7 +587,7 @@ class HookTests(unittest.TestCase):
         }
         self.assertIsNone(self.call("post-tool-use", call))
         status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("最近实际执行：Luna · 只读侦察（失败）", status)
+        self.assertIn("最近实际执行：只读侦察（失败）", status)
         self.assertIn("累计实际执行：成功 0，失败 1", status)
 
     def test_cancelled_wait_counts_as_failed_actual_execution(self):
@@ -539,27 +693,403 @@ class HookTests(unittest.TestCase):
         }
         self.assertIsNone(self.call("pre-tool-use", wait_call))
 
-    def test_external_agent_consumes_the_single_delegation_budget(self):
+    def test_on_mode_denies_every_native_spawn_without_consuming_the_slot(self):
         self.prompt("/router on")
         self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+
+        # Valid DELEGATE decision: denial points at the synchronous MCP call.
         external = self.call(
             "pre-tool-use",
             {
                 "tool_name": "spawn_agent",
                 "tool_use_id": "hegel-1",
-                "tool_input": {"agent_type": "Hegel"},
+                "tool_input": {"agent_type": "Hegel", "task": "外部插件的侦察任务"},
             },
         )
-        self.assertIsNone(external)
-        duplicate = self.call(
+        reason = external["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(external["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("smart_router.route_task", reason)
+        self.assertIn("decision_id", reason)
+
+        # The denial consumed nothing: route_task still claims the same lease.
+        routed = self.call(
             "pre-tool-use",
             {
                 "tool_name": "mcp__smart_router__route_task",
-                "tool_use_id": "router-scout-after-hegel",
-                "tool_input": {"role": "router_scout", "task": "批量盘点日志和 manifest"},
+                "tool_use_id": "router-scout-after-denial",
+                "tool_input": {"role": "router_scout", "task": "批量盘点所有日志和 manifest"},
             },
         )
-        self.assertIn("single delegation slot", duplicate["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(routed)
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["current_delegation"]["status"], "started")
+
+    def test_native_spawn_denial_reflects_delegation_slot_state(self):
+        self.prompt("/router on")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+        state = router_core.load_state(self.data, self.session)
+        decision = state["last_decision"]
+
+        running = dict(state)
+        running["current_delegation"] = {
+            **state["current_delegation"],
+            "status": "running",
+            "tool_use_id": "mcp-in-flight",
+        }
+        router_core.save_state(self.data, self.session, running)
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-while-running",
+                "tool_input": {"agent_type": "Hegel"},
+            },
+        )
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("already running", reason)
+        self.assertIn("wait for its receipt", reason)
+
+        finished = dict(running)
+        finished["current_delegation"] = {**running["current_delegation"], "status": "completed"}
+        router_core.save_state(self.data, self.session, finished)
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-after-completion",
+                "tool_input": {"agent_type": "Hegel"},
+            },
+        )
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("already finished", reason)
+        self.assertIn("integrate the existing receipt", reason)
+
+        # A stale decision whose slot belongs to another lease is treated as
+        # having no usable decision instead of inviting lease replay.
+        mismatched = dict(finished)
+        mismatched["current_delegation"] = {
+            "decision_id": "f" * 64,
+            "lease_id": "e" * 32,
+            "status": "available",
+        }
+        router_core.save_state(self.data, self.session, mismatched)
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-stale-lease",
+                "tool_input": {"agent_type": "Hegel"},
+            },
+        )
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("inline in Sol", reason)
+
+    def test_posttool_double_failure_ledger_reaches_state_telemetry_and_status(self):
+        self.prompt("/router on")
+        self.prompt("跨文件复核这四个模块的合同一致性问题并归因缺陷")
+        meta = {
+            "role": "router_reviewer",
+            "model": None,
+            "provider": None,
+            "route_label": None,
+            "selected_executor": "glm_reviewer",
+            "attempted_executors": ["glm_reviewer", "terra_reviewer"],
+            "final_executor": None,
+            "route_path": ["glm_reviewer", "terra_reviewer"],
+            "route_path_label": "GLM-5.3 → Terra",
+            "fallback_occurred": True,
+            "fallback_stage": "runtime",
+            "fallback_reason_code": "terra_runtime_failure",
+            "fallback_reason": "terra_runtime_failure",
+            "selection_bypass_reason": None,
+            "selection_bypass_reasons": {},
+            "usage": {"input_tokens": 48, "output_tokens": 22},
+            "attempt_usage": [
+                {
+                    "executor": "glm_reviewer",
+                    "model_label": "GLM-5.3",
+                    "outcome": "runtime_failure",
+                    "usage": {"input_tokens": 31, "output_tokens": 12},
+                    "duration_ms": 9800,
+                },
+                {
+                    "executor": "terra_reviewer",
+                    "model_label": "Terra",
+                    "outcome": "runtime_failure",
+                    "usage": {"input_tokens": 17, "output_tokens": 10},
+                    "duration_ms": 5200,
+                },
+            ],
+            "duration_ms": 15000,
+        }
+        call = {
+            "tool_name": "mcp__smart_router__route_task",
+            "tool_use_id": "mcp-double-fail-1",
+            "tool_input": {"role": "router_reviewer", "task": "跨文件复核这四个模块的合同一致性问题并归因缺陷"},
+            "tool_response": {"isError": True, "structuredContent": {"status": "failed", "_router_meta": meta}},
+        }
+        self.assertIsNone(self.call("post-tool-use", call))
+        state = router_core.load_state(self.data, self.session)
+        last = state["last_execution"]
+        self.assertEqual(last["outcome"], "failed")
+        self.assertEqual(last["route_path"], ["glm_reviewer", "terra_reviewer"])
+        self.assertIsNone(last["final_executor"])
+        self.assertEqual(last["fallback_reason_code"], "terra_runtime_failure")
+        self.assertEqual(last["selection_bypass_reasons"], {})
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("最近实际执行：GLM-5.3 → Terra（失败）", status)
+        self.assertIn("回退原因：terra_runtime_failure", status)
+        self.assertIn("GLM-5.3：失败｜9.8s｜input 31｜output 12", status)
+        self.assertIn("Terra：失败｜5.2s｜input 17｜output 10", status)
+        telemetry = (self.data / "telemetry.jsonl").read_text(encoding="utf-8")
+        self.assertIn("terra_runtime_failure", telemetry)
+        self.assertIn("GLM-5.3 → Terra", telemetry)
+
+    def test_posttool_multiple_selection_bypasses_are_all_shown(self):
+        self.prompt("/router on")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+        meta = {
+            "role": "router_scout",
+            "route_label": "Terra · 只读侦察",
+            "selected_executor": "terra_scout",
+            "attempted_executors": ["terra_scout"],
+            "final_executor": "terra_scout",
+            "route_path": ["terra_scout"],
+            "route_path_label": "Terra",
+            "fallback_occurred": False,
+            "fallback_stage": "selection",
+            "fallback_reason_code": "local_config_missing",
+            "fallback_reason": "local_config_missing",
+            "selection_bypass_reason": "local_config_missing",
+            "selection_bypass_reasons": {
+                "local": "local_config_missing",
+                "glm": "glm_peak_window",
+            },
+            "usage": {"input_tokens": 90, "output_tokens": 20},
+            "attempt_usage": [
+                {
+                    "executor": "terra_scout",
+                    "model_label": "Terra",
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 90, "output_tokens": 20},
+                    "duration_ms": 15700,
+                }
+            ],
+            "duration_ms": 15700,
+        }
+        call = {
+            "tool_name": "mcp__smart_router__route_task",
+            "tool_use_id": "mcp-dual-bypass-1",
+            "tool_input": {"role": "router_scout", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
+            "tool_response": {"isError": False, "structuredContent": {"status": "completed", "_router_meta": meta}},
+        }
+        self.assertIsNone(self.call("post-tool-use", call))
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(
+            state["last_execution"]["selection_bypass_reasons"],
+            {"local": "local_config_missing", "glm": "glm_peak_window"},
+        )
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("未尝试：Local 配置缺失；GLM 高峰时段", status)
+
+    def test_posttool_deadline_and_single_failure_reasons_are_labeled(self):
+        self.prompt("/router on")
+        self.prompt("跨文件复核这四个模块的合同一致性问题并归因缺陷")
+
+        deadline_meta = {
+            "role": "router_reviewer",
+            "route_label": None,
+            "selected_executor": "glm_reviewer",
+            "attempted_executors": ["glm_reviewer"],
+            "final_executor": None,
+            "route_path": ["glm_reviewer"],
+            "route_path_label": "GLM-5.3",
+            "fallback_occurred": False,
+            "fallback_stage": "deadline",
+            "fallback_reason_code": "shared_deadline_exhausted_before_fallback",
+            "fallback_reason": "shared_deadline_exhausted_before_fallback",
+            "selection_bypass_reason": None,
+            "selection_bypass_reasons": {},
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+            "attempt_usage": [
+                {
+                    "executor": "glm_reviewer",
+                    "model_label": "GLM-5.3",
+                    "outcome": "runtime_failure",
+                    "usage": {"input_tokens": 5, "output_tokens": 0},
+                    "duration_ms": 1000,
+                }
+            ],
+            "duration_ms": 1000,
+        }
+        call = {
+            "tool_name": "mcp__smart_router__route_task",
+            "tool_use_id": "mcp-deadline-1",
+            "tool_input": {"role": "router_reviewer", "task": "跨文件复核这四个模块的合同一致性问题并归因缺陷"},
+            "tool_response": {"isError": True, "structuredContent": {"status": "failed", "_router_meta": deadline_meta}},
+        }
+        self.assertIsNone(self.call("post-tool-use", call))
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("最近实际执行：GLM-5.3（失败）", status)
+        self.assertIn("回退未启动原因：shared_deadline_exhausted_before_fallback", status)
+        self.assertNotIn("terra_runtime_failure", status)
+
+        single_meta = {
+            **deadline_meta,
+            "fallback_stage": "runtime",
+            "fallback_reason_code": "terra_runtime_failure",
+            "fallback_reason": "terra_runtime_failure",
+            "selected_executor": "terra_reviewer",
+            "attempted_executors": ["terra_reviewer"],
+            "final_executor": None,
+            "route_path": ["terra_reviewer"],
+            "route_path_label": "Terra",
+            "attempt_usage": [
+                {
+                    "executor": "terra_reviewer",
+                    "model_label": "Terra",
+                    "outcome": "runtime_failure",
+                    "usage": {"input_tokens": 5, "output_tokens": 0},
+                    "duration_ms": 1000,
+                }
+            ],
+        }
+        second = {
+            **call,
+            "tool_use_id": "mcp-single-fail-1",
+            "tool_response": {"isError": True, "structuredContent": {"status": "failed", "_router_meta": single_meta}},
+        }
+        self.assertIsNone(self.call("post-tool-use", second))
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("最近实际执行：Terra（失败）", status)
+        self.assertIn("失败原因：terra_runtime_failure", status)
+        self.assertIn("Terra：失败", status)
+
+    def test_status_output_stays_within_hook_context_budget(self):
+        state = router_core.default_state(self.session)
+        state.update(
+            {
+                "mode": "ON",
+                "execution_profile": "GLM_FIRST",
+                "light_profile": "LOCAL_TEXT_FIRST",
+                "luna_mode": "LUNA_BOUNDED",
+                "last_decision": {"decision": "DELEGATE", "role": "router_scout"},
+                "last_execution": {
+                    "role": "router_scout",
+                    "outcome": "failed",
+                    "route_path_label": "GLM-5.3 → Terra",
+                    "fallback_occurred": True,
+                    "fallback_stage": "runtime",
+                    "fallback_reason_code": "terra_runtime_failure",
+                    "selection_bypass_reasons": {
+                        "glm": "glm_peak_window",
+                        "local": "local_config_model_catalog_mismatch",
+                    },
+                    "attempt_usage": [
+                        {
+                            "executor": "glm_scout",
+                            "model_label": "GLM-5.3",
+                            "outcome": "receipt_format_failure",
+                            "usage": {"input_tokens": 1234567, "output_tokens": 123456},
+                            "duration_ms": 123456,
+                        },
+                        {
+                            "executor": "terra_scout",
+                            "model_label": "Terra",
+                            "outcome": "runtime_failure",
+                            "usage": {"input_tokens": 7654321, "output_tokens": 654321},
+                            "duration_ms": 987654,
+                        },
+                    ],
+                    "duration_ms": 1111110,
+                },
+                "execution_counts": {"completed": 999999, "failed": 999999},
+                "active_writer": {"role": "router_docs"},
+            }
+        )
+        router_core.save_state(self.data, self.session, state)
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        # Keep a conservative character-level guard beneath the hook's
+        # additionalContextLimit=512 budget; the runtime enforces the token cap.
+        self.assertLessEqual(len(status), 512)
+
+    def test_on_mode_denies_native_spawn_after_inline_decision(self):
+        self.prompt("/router on")
+        self.prompt("实现一个小功能")  # INLINE_SOL decision
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "inline-spawn-1",
+                "tool_input": {"agent_type": "explorer"},
+            },
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("inline in Sol", denied["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_goal_continuation_without_decision_denies_native_spawn(self):
+        # A restored ON session with no last_decision models automatic Goal
+        # continuation: no UserPromptSubmit fires, so no fresh lease exists.
+        state = router_core.load_state(self.data, self.session)
+        state["mode"] = "ON"
+        state["last_decision"] = None
+        state["current_delegation"] = None
+        router_core.save_state(self.data, self.session, state)
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "Agent",
+                "tool_use_id": "goal-continuation-1",
+                "tool_input": {"agent_type": "worker"},
+            },
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("Goal continuation", reason)
+        self.assertIn("turn Smart Router off", reason)
+        telemetry = (self.data / "telemetry.jsonl").read_text(encoding="utf-8")
+        self.assertIn("native_spawn_denied", telemetry)
+
+    def test_tool_only_decision_denies_native_spawn(self):
+        self.prompt("/router on")
+        self.prompt("查看 git status")
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "tool-only-spawn-1",
+                "tool_input": {"agent_type": "Hegel"},
+            },
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("TOOL_ONLY", denied["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_off_and_shadow_keep_native_agent_compatibility(self):
+        self.prompt("/router on")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
+        self.prompt("/router shadow")
+        shadowed = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "shadow-hegel-1",
+                "tool_input": {"agent_type": "Hegel"},
+            },
+        )
+        self.assertIsNone(shadowed)
+        self.prompt("/router off")
+        off = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_use_id": "off-hegel-1",
+                "tool_input": {"agent_type": "Hegel"},
+            },
+        )
+        self.assertIsNone(off)
 
     def test_concurrent_pretool_claims_are_atomic(self):
         self.prompt("/router on")

@@ -9,6 +9,8 @@ import json
 from provider_policy import (
     LIGHT_PROFILE_LOCAL_TEXT_FIRST,
     LIGHT_PROFILE_LUNA_STABLE,
+    LUNA_BOUNDED,
+    LUNA_DISABLED,
     PROFILE_GLM_FIRST,
     PROFILE_STABLE,
 )
@@ -19,6 +21,7 @@ from router_core import (
     set_economics_policy,
     set_execution_profile,
     set_light_profile,
+    set_luna_mode,
     set_mode,
 )
 
@@ -36,6 +39,8 @@ def main() -> int:
             "glm-off",
             "local-on",
             "local-off",
+            "luna-on",
+            "luna-off",
             "economics-v1",
             "economics-v2",
             "route",
@@ -58,6 +63,11 @@ def main() -> int:
     if args.command in {"local-on", "local-off"}:
         profile = LIGHT_PROFILE_LOCAL_TEXT_FIRST if args.command == "local-on" else LIGHT_PROFILE_LUNA_STABLE
         state = set_light_profile(root, args.session_id, profile, activate=args.command == "local-on")
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0
+    if args.command in {"luna-on", "luna-off"}:
+        mode = LUNA_BOUNDED if args.command == "luna-on" else LUNA_DISABLED
+        state = set_luna_mode(root, args.session_id, mode, activate=args.command == "luna-on")
         print(json.dumps(state, ensure_ascii=False, indent=2))
         return 0
     if args.command in {"economics-v1", "economics-v2"}:

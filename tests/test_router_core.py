@@ -29,6 +29,11 @@ class RouterCoreTests(unittest.TestCase):
             "$router-control glm 关闭": "GLM_OFF",
             "$router-control local 开启": "LOCAL_ON",
             "$router-control local 关闭": "LOCAL_OFF",
+            "$router-control luna 开启": "LUNA_ON",
+            "/router luna on": "LUNA_ON",
+            "$router-control luna 关闭": "LUNA_OFF",
+            "/router luna off": "LUNA_OFF",
+            "$router-control 开启luna": "LUNA_ON",
             "$router-control 经济策略 v2": "ECON_V2",
             "/router policy v2": "ECON_V2",
             "$router-control 经济策略 v1": "ECON_V1",
@@ -196,18 +201,45 @@ class RouterCoreTests(unittest.TestCase):
             state.pop("execution_counts")
             state.pop("last_execution")
             state.pop("recent_execution_keys")
-            state["schema_version"] = 1
+            state.pop("luna_mode")
+            state["schema_version"] = 7
             state["mode"] = "ON"
+            state["light_profile"] = "LUNA_STABLE"
             router_core._atomic_json(router_core.state_path(root, "s1"), state)
             loaded = router_core.load_state(root, "s1")
             self.assertEqual(loaded["mode"], "ON")
-            self.assertEqual(loaded["schema_version"], 7)
+            self.assertEqual(loaded["schema_version"], 8)
             self.assertIsNone(loaded["current_delegation"])
             self.assertEqual(loaded["execution_profile"], "STABLE")
             self.assertEqual(loaded["light_profile"], "LUNA_STABLE")
+            # Pre-v8 implicit LUNA_STABLE never carried explicit Luna consent.
+            self.assertEqual(loaded["luna_mode"], "LUNA_DISABLED")
             self.assertEqual(loaded["economics_policy"], "V2_STATIC")
             self.assertEqual(loaded["execution_counts"], {"completed": 0, "failed": 0})
             self.assertEqual(loaded["recent_execution_keys"], [])
+
+    def test_v8_state_preserves_explicit_luna_mode_and_default_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(router_core.default_state("s1")["luna_mode"], "LUNA_DISABLED")
+            router_core.set_luna_mode(root, "s1", "LUNA_BOUNDED")
+            self.assertEqual(router_core.load_state(root, "s1")["luna_mode"], "LUNA_BOUNDED")
+            off = router_core.set_luna_mode(root, "s1", "LUNA_DISABLED")
+            self.assertEqual(off["luna_mode"], "LUNA_DISABLED")
+            self.assertEqual(off["mode"], "OFF", "luna off must not touch router ON/OFF")
+
+    def test_luna_on_activates_routing_and_v7_luna_consent_is_never_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            activated = router_core.set_luna_mode(root, "s1", "LUNA_BOUNDED", activate=True)
+            self.assertEqual(activated["mode"], "ON")
+            state = router_core.default_state("s2")
+            state["schema_version"] = 7
+            state["luna_mode"] = "LUNA_BOUNDED"
+            state["mode"] = "ON"
+            router_core._atomic_json(router_core.state_path(root, "s2"), state)
+            loaded = router_core.load_state(root, "s2")
+            self.assertEqual(loaded["luna_mode"], "LUNA_DISABLED")
 
     def test_cleanup_expired_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -469,6 +501,9 @@ class RouterCoreTests(unittest.TestCase):
         self.assertLessEqual(len(delegated), 512)
         self.assertIn("receipt._router_meta.route_label", delegated)
         self.assertIn("路由回退：Sol（委派未完成）", delegated)
+        self.assertIn("luna=LUNA_DISABLED", delegated)
+        luna_delegated = router_core.routing_context("ON", scout, luna_mode="LUNA_BOUNDED")
+        self.assertIn("luna=LUNA_BOUNDED", luna_delegated)
 
         high_risk = router_core.classify("实现生产数据库迁移并部署")
         inline = router_core.routing_context("ON", high_risk)
@@ -482,7 +517,15 @@ class RouterCoreTests(unittest.TestCase):
 
         shadow = router_core.routing_context("SHADOW", scout)
         self.assertLessEqual(len(shadow), 240)
-        self.assertIn("路由预览：Luna · 只读侦察", shadow)
+        self.assertIn("路由预览：Terra · 只读侦察", shadow)
+        luna_shadow = router_core.routing_context("SHADOW", scout, luna_mode="LUNA_BOUNDED")
+        self.assertIn("Luna / Terra 动态执行", luna_shadow)
+        glm_light_shadow = router_core.routing_context("SHADOW", scout, "GLM_FIRST")
+        self.assertIn("GLM / Terra 动态执行", glm_light_shadow)
+        local_shadow = router_core.routing_context(
+            "SHADOW", scout, light_profile="LOCAL_TEXT_FIRST", luna_mode="LUNA_BOUNDED"
+        )
+        self.assertIn("Local Text / Luna 动态执行", local_shadow)
 
         worker = router_core.classify("实现这个边界清晰的小功能")
         worker["decision_id"] = "0" * 64

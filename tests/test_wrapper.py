@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import datetime as dt
 from pathlib import Path
@@ -175,9 +176,19 @@ class WrapperTests(unittest.TestCase):
 
         with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
             receipt = run_agent.run_task("router_scout", "搜索仓库中的测试文件")
-        self.assertEqual(receipt["_router_meta"]["model"], "gpt-5.6-luna")
-        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["model"], "gpt-5.6-terra")
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_scout")
         self.assertEqual(receipt["_router_meta"]["provider"], "openai")
+        self.assertEqual(receipt["_router_meta"]["selected_executor"], "terra_scout")
+        self.assertEqual(receipt["_router_meta"]["final_executor"], "terra_scout")
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["terra_scout"])
+        self.assertEqual(receipt["_router_meta"]["route_path"], ["terra_scout"])
+        self.assertEqual(receipt["_router_meta"]["route_path_label"], "Terra")
+        self.assertFalse(receipt["_router_meta"]["fallback_occurred"])
+        self.assertIsNone(receipt["_router_meta"]["fallback_stage"])
+        self.assertIsNone(receipt["_router_meta"]["fallback_reason_code"])
+        self.assertIsNone(receipt["_router_meta"]["selection_bypass_reason"])
+        self.assertEqual(receipt["_router_meta"]["requested_luna_mode"], "LUNA_DISABLED")
 
     def test_usage_and_duration_are_recorded_without_child_content(self):
         def fake_run(command, **kwargs):
@@ -380,8 +391,11 @@ class WrapperTests(unittest.TestCase):
                 )
         success.assert_called_once()
         failure.assert_not_called()
-        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_scout")
         self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_receipt_format_failure")
+        self.assertEqual(receipt["_router_meta"]["fallback_reason_code"], "local_receipt_format_failure")
+        self.assertTrue(receipt["_router_meta"]["fallback_occurred"])
+        self.assertEqual(receipt["_router_meta"]["fallback_stage"], "receipt")
         self.assertEqual(receipt["_router_meta"]["usage"]["input_tokens"], 4)
 
     def test_glm_wire_adapter_handles_observed_maas_variants(self):
@@ -758,7 +772,7 @@ class WrapperTests(unittest.TestCase):
         self.assertNotIn("test-local-key", " ".join(command))
         self.assertEqual(child_env["LOCAL_MODEL_API_KEY"], "test-local-key")
 
-    def test_local_runtime_failure_falls_back_to_luna_and_opens_only_local_circuit(self):
+    def test_local_runtime_failure_falls_back_to_terra_by_default_and_luna_when_enabled(self):
         calls = []
 
         def fake_run(command, **kwargs):
@@ -781,14 +795,32 @@ class WrapperTests(unittest.TestCase):
                 )
             local_health = local_provider.read_health(tmp)
             glm_health = provider_policy.read_health(tmp)
-        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_scout")
         self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_runtime_failure")
-        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["local_scout", "luna_scout"])
+        self.assertEqual(receipt["_router_meta"]["fallback_stage"], "runtime")
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["local_scout", "terra_scout"])
+        self.assertEqual(receipt["_router_meta"]["route_path_label"], "Local Text Test → Terra")
         self.assertEqual(local_health["state"], "open")
         self.assertEqual(glm_health["state"], "closed")
         self.assertEqual(len(calls), 2)
 
-    def test_local_invalid_receipt_falls_back_to_luna(self):
+        calls.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                receipt = run_agent.run_task(
+                    "router_scout",
+                    "搜索仓库中的测试文件",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    luna_mode="LUNA_BOUNDED",
+                    env={"LOCAL_MODEL_API_KEY": "test-local-key"},
+                    codex_home=tmp,
+                )
+        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["attempted_executors"], ["local_scout", "luna_scout"])
+        self.assertEqual(len(calls), 2)
+
+    def test_local_invalid_receipt_falls_back_to_terra(self):
         calls = []
 
         def fake_run(command, **kwargs):
@@ -810,19 +842,144 @@ class WrapperTests(unittest.TestCase):
                     env={"LOCAL_MODEL_API_KEY": "test-local-key"},
                     codex_home=tmp,
                 )
-        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_scout")
         self.assertEqual(receipt["_router_meta"]["fallback_reason"], "local_receipt_format_failure")
         self.assertEqual(len(calls), 2)
+
+    def test_local_failure_falls_back_to_glm_when_luna_disabled(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if "deepseek-v4-flash" in command:
+                return subprocess.CompletedProcess(command, 1, "", "connection refused")
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        off_peak = dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                receipt = run_agent.run_task(
+                    "router_scout",
+                    "搜索仓库中的测试文件",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    execution_profile="GLM_FIRST",
+                    now=off_peak,
+                    env={"LOCAL_MODEL_API_KEY": "test-local-key", provider_policy.GLM_ENV_KEY: "glm-key"},
+                    codex_home=tmp,
+                )
+            glm_health = provider_policy.read_health(tmp)
+        meta = receipt["_router_meta"]
+        self.assertEqual(meta["executor"], "glm_scout")
+        self.assertEqual(meta["attempted_executors"], ["local_scout", "glm_scout"])
+        self.assertEqual(meta["route_path_label"], "Local Text Test → GLM-5.3")
+        self.assertEqual(meta["fallback_reason"], "local_runtime_failure")
+        self.assertTrue(meta["fallback_occurred"])
+        self.assertEqual(glm_health["state"], "closed")
+        self.assertEqual(len(calls), 2)
+
+    def test_chain_never_invokes_more_than_two_models(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            model = command[command.index("--model") + 1]
+            if model in {"deepseek-v4-flash", "gpt-5.6-luna"}:
+                return subprocess.CompletedProcess(command, 1, "", "connection refused")
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        off_peak = dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                with self.assertRaises(run_agent.ChildFailure):
+                    run_agent.run_task(
+                        "router_scout",
+                        "搜索仓库中的测试文件",
+                        light_profile="LOCAL_TEXT_FIRST",
+                        execution_profile="GLM_FIRST",
+                        luna_mode="LUNA_BOUNDED",
+                        now=off_peak,
+                        env={"LOCAL_MODEL_API_KEY": "test-local-key", provider_policy.GLM_ENV_KEY: "glm-key"},
+                        codex_home=tmp,
+                    )
+        attempted_models = [command[command.index("--model") + 1] for command in calls]
+        self.assertEqual(attempted_models, ["deepseek-v4-flash", "gpt-5.6-luna"])
+        self.assertNotIn("glm-5.3", attempted_models)
+        self.assertNotIn("gpt-5.6-terra", attempted_models)
+
+    def test_glm_peak_selection_bypass_is_recorded_as_not_attempted(self):
+        def fake_run(command, **kwargs):
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        peak = dt.datetime(2026, 8, 24, 15, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                receipt = run_agent.run_task(
+                    "router_reviewer",
+                    "跨文件复核这四个模块的合同一致性问题并归因缺陷",
+                    execution_profile="GLM_FIRST",
+                    now=peak,
+                    env={provider_policy.GLM_ENV_KEY: "glm-key"},
+                    codex_home=tmp,
+                )
+        meta = receipt["_router_meta"]
+        self.assertEqual(meta["executor"], "terra_reviewer")
+        self.assertEqual(meta["selected_executor"], "terra_reviewer")
+        self.assertEqual(meta["attempted_executors"], ["terra_reviewer"])
+        self.assertEqual(meta["route_path"], ["terra_reviewer"])
+        self.assertFalse(meta["fallback_occurred"])
+        self.assertEqual(meta["fallback_stage"], "selection")
+        self.assertEqual(meta["fallback_reason_code"], "glm_peak_window")
+        self.assertEqual(meta["fallback_reason"], "glm_peak_window")
+        self.assertEqual(meta["selection_bypass_reason"], "glm_peak_window")
+        self.assertEqual(meta["route_path_label"], "Terra")
+
+    def test_mcp_route_task_passes_luna_mode_and_schema_defaults(self):
+        schema = router_mcp.tool_definition()["inputSchema"]["properties"]
+        self.assertEqual(schema["luna_mode"]["default"], "LUNA_DISABLED")
+        self.assertEqual(schema["luna_mode"]["enum"], ["LUNA_BOUNDED", "LUNA_DISABLED"])
+        request = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "route_task",
+                "arguments": {
+                    "decision_id": "0" * 64,
+                    "lease_id": "0" * 32,
+                    "role": "router_scout",
+                    "task": "搜索文件",
+                    "luna_mode": "LUNA_BOUNDED",
+                },
+            },
+        }
+        stream = io.StringIO()
+        with mock.patch("router_mcp.routing_enabled", return_value=True), mock.patch(
+            "router_mcp.consume_runtime_lease", return_value=True
+        ), mock.patch(
+            "router_mcp.run_task", return_value=valid_receipt()
+        ) as task, redirect_stdout(stream):
+            router_mcp.handle(request)
+        response = json.loads(stream.getvalue())
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(task.call_args.kwargs.get("luna_mode"), "LUNA_BOUNDED")
 
     def test_local_no_auth_provider_is_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.local_config(tmp, env_key=None)
             resolution = provider_policy.resolve_executor(
-                "router_monitor", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
+                "router_scout", light_profile="LOCAL_TEXT_FIRST", env={}, home=tmp
             )
             environment, key = run_agent._child_env(resolution.executor, {}, tmp)
             command = run_agent.build_command(
-                "router_monitor", Path(tmp) / "receipt.json", resolution.executor, home=tmp
+                "router_scout", Path(tmp) / "receipt.json", resolution.executor, home=tmp
             )
         self.assertIsNone(key)
         self.assertNotIn("model_providers.local_text_test.env_key", " ".join(command))
@@ -890,7 +1047,7 @@ class WrapperTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 1, stdout, '{"code":1305}')
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
-            with self.assertRaisesRegex(run_agent.ChildFailure, "automatic writer fallback was suppressed"):
+            with self.assertRaisesRegex(run_agent.RoutedTaskFailure, "automatic writer fallback was suppressed") as raised:
                 run_agent.run_task(
                     "router_worker",
                     "实现这个边界清晰的小功能",
@@ -900,6 +1057,175 @@ class WrapperTests(unittest.TestCase):
                     env={provider_policy.GLM_ENV_KEY: "test-key"},
                     codex_home=tmp,
                 )
+        failure = raised.exception
+        self.assertTrue(failure.may_have_mutated)
+        meta = failure.router_meta
+        # The suppressed writer still leaves a complete single-attempt ledger.
+        self.assertEqual(meta["attempted_executors"], ["glm_worker"])
+        self.assertEqual(meta["final_executor"], None)
+        self.assertEqual(meta["route_path"], ["glm_worker"])
+        self.assertEqual(meta["fallback_reason_code"], "glm_runtime_failure")
+        self.assertEqual(meta["fallback_stage"], "runtime")
+        self.assertEqual(len(meta["attempt_usage"]), 1)
+        self.assertEqual(meta["attempt_usage"][0]["outcome"], "runtime_failure")
+
+    def test_double_failure_returns_structured_routed_task_failure(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            calls.append(command)
+            model = command[command.index("--model") + 1]
+            usage = json.dumps(
+                {"type": "turn.completed", "usage": {"input_tokens": 11, "output_tokens": 7}}
+            )
+            return subprocess.CompletedProcess(command, 1, usage, "connection reset")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(run_agent.RoutedTaskFailure) as raised:
+                run_agent.run_task(
+                    "router_reviewer",
+                    "请独立做一次代码审查",
+                    execution_profile="GLM_FIRST",
+                    now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    env={provider_policy.GLM_ENV_KEY: "test-key"},
+                    codex_home=tmp,
+                )
+        meta = raised.exception.router_meta
+        self.assertEqual(len(calls), 2, "GLM then Terra must both be attempted before failing")
+        self.assertEqual(meta["attempted_executors"], ["glm_reviewer", "terra_reviewer"])
+        self.assertEqual(meta["route_path"], ["glm_reviewer", "terra_reviewer"])
+        self.assertEqual(meta["route_path_label"], "GLM-5.3 → Terra")
+        self.assertIsNone(meta["final_executor"])
+        self.assertIsNone(meta["executor"])
+        self.assertTrue(meta["fallback_occurred"])
+        self.assertEqual(meta["fallback_stage"], "runtime")
+        self.assertEqual(meta["fallback_reason_code"], "terra_runtime_failure")
+        self.assertEqual(len(meta["attempt_usage"]), 2)
+        self.assertEqual([item["outcome"] for item in meta["attempt_usage"]], ["runtime_failure", "runtime_failure"])
+        self.assertEqual(meta["usage"]["input_tokens"], 22)
+        self.assertEqual(meta["usage"]["output_tokens"], 14)
+        self.assertGreaterEqual(meta["duration_ms"], 0)
+
+    def test_deadline_exhausted_before_terra_is_never_terras_failure(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            calls.append(command)
+            time.sleep(1.2)  # exceed the shared deadline during the GLM attempt
+            return subprocess.CompletedProcess(command, 1, "", "connection reset")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(run_agent.RoutedTaskFailure) as raised:
+                run_agent.run_task(
+                    "router_reviewer",
+                    "请独立做一次代码审查",
+                    timeout=1,
+                    execution_profile="GLM_FIRST",
+                    now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    env={provider_policy.GLM_ENV_KEY: "test-key"},
+                    codex_home=tmp,
+                )
+        meta = raised.exception.router_meta
+        attempted_models = [command[command.index("--model") + 1] for command in calls]
+        self.assertEqual(attempted_models, ["glm-5.3"], "Terra must never be invoked after the deadline is gone")
+        self.assertEqual(meta["attempted_executors"], ["glm_reviewer"])
+        self.assertEqual(meta["route_path"], ["glm_reviewer"])
+        self.assertFalse(meta["fallback_occurred"])
+        self.assertEqual(meta["fallback_stage"], "deadline")
+        self.assertEqual(meta["fallback_reason_code"], "shared_deadline_exhausted_before_fallback")
+        self.assertEqual(len(meta["attempt_usage"]), 1)
+        self.assertNotIn("terra_runtime_failure", json.dumps(meta))
+
+    def test_deadline_exhausted_on_local_chain_skips_every_remaining_candidate(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            if "--output-last-message" not in command:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            calls.append(command)
+            time.sleep(1.2)  # exceed the shared deadline during the local attempt
+            return subprocess.CompletedProcess(command, 1, "", "connection reset")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+                with self.assertRaises(run_agent.RoutedTaskFailure) as raised:
+                    run_agent.run_task(
+                        "router_scout",
+                        "搜索仓库中的测试文件",
+                        timeout=1,
+                        light_profile="LOCAL_TEXT_FIRST",
+                        luna_mode="LUNA_BOUNDED",
+                        execution_profile="GLM_FIRST",
+                        now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                        env={
+                            "LOCAL_MODEL_API_KEY": "test-local-key",
+                            provider_policy.GLM_ENV_KEY: "test-key",
+                        },
+                        codex_home=tmp,
+                    )
+            local_health = local_provider.read_health(tmp)
+        meta = raised.exception.router_meta
+        attempted_models = [command[command.index("--model") + 1] for command in calls]
+        self.assertEqual(attempted_models, ["deepseek-v4-flash"], "Luna/GLM/Terra must not run after the deadline")
+        self.assertEqual(meta["attempted_executors"], ["local_scout"])
+        self.assertFalse(meta["fallback_occurred"])
+        self.assertEqual(meta["fallback_stage"], "deadline")
+        self.assertEqual(meta["fallback_reason_code"], "shared_deadline_exhausted_before_fallback")
+        self.assertEqual(local_health["state"], "open", "the real local failure still opens its own circuit")
+
+    def test_run_task_rejects_monitor_role_outside_wait_tool(self):
+        with mock.patch("run_agent.subprocess.run") as run:
+            with self.assertRaisesRegex(ValueError, "wait_for_condition"):
+                run_agent.run_task("router_monitor", "等待构建完成")
+            run.assert_not_called()
+
+    def test_mcp_returns_structured_failure_ledger_for_routed_task_failure(self):
+        failure_meta = {
+            "role": "router_reviewer",
+            "attempted_executors": ["glm_reviewer", "terra_reviewer"],
+            "route_path": ["glm_reviewer", "terra_reviewer"],
+            "route_path_label": "GLM-5.3 → Terra",
+            "fallback_occurred": True,
+            "fallback_stage": "runtime",
+            "fallback_reason_code": "terra_runtime_failure",
+            "attempt_usage": [],
+        }
+        request = {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "route_task",
+                "arguments": {
+                    "decision_id": "0" * 64,
+                    "lease_id": "0" * 32,
+                    "role": "router_reviewer",
+                    "task": "请独立做一次代码审查",
+                },
+            },
+        }
+        stream = io.StringIO()
+        with mock.patch("router_mcp.routing_enabled", return_value=True), mock.patch(
+            "router_mcp.consume_runtime_lease", return_value=True
+        ), mock.patch(
+            "router_mcp.run_task",
+            side_effect=run_agent.RoutedTaskFailure(
+                "Codex child failed with exit 1: terra transport",
+                router_meta=failure_meta,
+            ),
+        ), redirect_stdout(stream):
+            router_mcp.handle(request)
+        response = json.loads(stream.getvalue())
+        self.assertTrue(response["result"]["isError"])
+        structured = response["result"]["structuredContent"]
+        self.assertEqual(structured["status"], "failed")
+        self.assertEqual(structured["_router_meta"]["fallback_reason_code"], "terra_runtime_failure")
+        self.assertEqual(structured["_router_meta"]["route_path"], ["glm_reviewer", "terra_reviewer"])
 
     def test_writer_failure_without_complete_evidence_suppresses_fallback(self):
         self.assertTrue(run_agent._writer_failure_may_have_mutated("router_worker", None, None, ""))
