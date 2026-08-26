@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import router_core
 import local_provider
+import install_agents
 
 
 class HookTests(unittest.TestCase):
@@ -22,13 +23,21 @@ class HookTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.data = Path(self.temp.name)
         self.session = "test-session"
+        self.default_home = self.ready_home("default-home")
+        self.previous_codex_home = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = str(self.default_home)
 
     def tearDown(self):
+        if self.previous_codex_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = self.previous_codex_home
         self.temp.cleanup()
 
     def call(self, event, payload, extra_env=None):
         env = os.environ.copy()
         env["PLUGIN_DATA"] = str(self.data)
+        env["CODEX_HOME"] = str(self.default_home)
         if extra_env:
             env.update(extra_env)
         result = subprocess.run(
@@ -610,6 +619,123 @@ class HookTests(unittest.TestCase):
         for event in ("SessionStart", "UserPromptSubmit"):
             command_hook = config["hooks"][event][0]["hooks"][0]
             self.assertEqual(command_hook["additionalContextLimit"], 512)
+        for entries in config["hooks"].values():
+            command = entries[0]["hooks"][0]["command"]
+            self.assertIn("/smart-router", command)
+            self.assertIn("$router_base/runtime-current", command)
+            self.assertIn("$router_link/hooks/router_hook.py", command)
+            self.assertIn("plugin_runtime", command)
+            self.assertIn("runtime-releases/$router_suffix", command)
+            self.assertIn("else exit 0", command)
+
+    def test_hook_uses_stable_runtime_when_versioned_cache_disappears(self):
+        stable_home = self.data / "stable-runtime-home"
+        errors, _ = install_agents.install(stable_home, apply=True)
+        self.assertEqual(errors, 0)
+        config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        env = os.environ.copy()
+        env.update(
+            {
+                "CODEX_HOME": str(stable_home),
+                "PLUGIN_DATA": str(self.data / "stable-plugin-data"),
+                "PLUGIN_ROOT": str(self.data / "deleted-version-cache"),
+            }
+        )
+        result = subprocess.run(
+            ["sh", "-c", command],
+            input=json.dumps({"session_id": "stable-runtime-session", "prompt": "$router-control 状态"}),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertIn("智能路由", output["hookSpecificOutput"]["additionalContext"])
+
+    def test_hook_fails_open_when_stable_and_plugin_runtime_are_missing(self):
+        empty_home = self.data / "empty-runtime-home"
+        empty_home.mkdir()
+        config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        env = os.environ.copy()
+        env.update({"CODEX_HOME": str(empty_home), "PLUGIN_ROOT": str(self.data / "missing-plugin")})
+        result = subprocess.run(
+            ["sh", "-c", command],
+            input=json.dumps({"session_id": "missing", "prompt": "hello"}),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_hook_fails_open_when_stable_python_returns_nonzero(self):
+        stable_home = self.data / "broken-runtime-home"
+        errors, _ = install_agents.install(stable_home, apply=True)
+        self.assertEqual(errors, 0)
+        hook = stable_home / install_agents.RUNTIME_SUBDIR / "hooks" / "router_hook.py"
+        hook.write_text("raise SystemExit(9)\n", encoding="utf-8")
+        config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        env = os.environ.copy()
+        env.update({"CODEX_HOME": str(stable_home), "PLUGIN_ROOT": str(self.data / "missing-plugin")})
+        result = subprocess.run(
+            ["sh", "-c", command],
+            input=json.dumps({"session_id": "broken", "prompt": "hello"}),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_hook_does_not_execute_unmanaged_runtime_current_directory(self):
+        unmanaged_home = self.data / "unmanaged-runtime-home"
+        hook = unmanaged_home / "smart-router" / "runtime-current" / "hooks" / "router_hook.py"
+        hook.parent.mkdir(parents=True)
+        hook.write_text("print('UNMANAGED_EXECUTED')\n", encoding="utf-8")
+        config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        env = os.environ.copy()
+        env.update({"CODEX_HOME": str(unmanaged_home), "PLUGIN_ROOT": str(self.data / "missing-plugin")})
+        result = subprocess.run(
+            ["sh", "-c", command],
+            input="{}",
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_hook_rejects_secondary_release_symlink(self):
+        stable_home = self.data / "secondary-link-home"
+        errors, _ = install_agents.install(stable_home, apply=True)
+        self.assertEqual(errors, 0)
+        current = stable_home / install_agents.RUNTIME_SUBDIR
+        release = current.resolve()
+        outside = self.data / "moved-release"
+        release.rename(outside)
+        release.symlink_to(outside, target_is_directory=True)
+        config = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        env = os.environ.copy()
+        env.update({"CODEX_HOME": str(stable_home), "PLUGIN_ROOT": str(self.data / "missing-plugin")})
+        result = subprocess.run(
+            ["sh", "-c", command],
+            input="{}",
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

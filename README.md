@@ -6,7 +6,7 @@
 
 1. 在 Codex 的 `/plugins` 中安装并启用 **Sol · GLM · Terra · Luna · Local 智能路由**。
 2. 先预览 agent、配置注册和本地 wrapper 安装（含 TOML diff）：`python3 scripts/install_agents.py`
-3. 确认后安装：`python3 scripts/install_agents.py --apply`。安装器会备份 `~/.codex/config.toml`，注册六个角色与 `smart_router` MCP，遇到同名配置会拒绝覆盖。
+3. 确认后安装：`python3 scripts/install_agents.py --apply`。安装器会备份 `~/.codex/config.toml`，注册六个角色与 `smart_router` MCP，并把完整运行包写入 `~/.codex/smart-router/runtime-releases/`，再原子切换 `runtime-current` 稳定入口；遇到同名配置、符号链接路径或被修改的受管运行包会拒绝覆盖。
 4. 如需 GLM 路由，运行 `python3 scripts/configure_glm.py`，在隐藏输入提示中粘贴 Coding Plan Key。密钥只写入 `~/.codex/smart-router/providers.env`（权限 `0600`），不会进入项目、命令行或子模型 shell。
 5. 如需先用 GLM-5.3 验证未来的 DeepSeek 本地文本路径，运行 `python3 scripts/configure_local_provider.py --glm-surrogate`。它只写 provider 配置和模型目录，复用现有 `ZHIPU_API_KEY` 的环境变量名，不复制密钥。
 6. 新开或恢复一个 Codex 会话，按需组合：
@@ -16,6 +16,8 @@
 7. 此后直接正常提需求；恢复同一会话时无需再次开启。
 
 每个新会话默认 `OFF + STABLE + LUNA_STABLE`。可随时使用 `$router-control 状态`、`$router-control 影子模式`、`glm/local 关闭` 或 `$router-control 关闭`。`glm 关闭` 和 `local 关闭` 只恢复各自的执行配置，不改变当前会话的 ON/OFF 状态。
+
+插件升级后仍建议新开一个 Codex 会话，让新 skill、hook 定义和 MCP schema 在清晰边界上重新加载。已完成 `--apply` 的安装会让新 hook 优先使用 `runtime-current`，因此后续清理版本 cache 不会影响执行；稳定入口缺失时回退当前 `$PLUGIN_ROOT`，两者都缺失时 hook 静默放行，避免阻断发消息。升级前就已加载旧 hook 命令的活跃会话无法自动获得这项新逻辑，应新开会话；安装器不会假装能够改写已经载入内存的 hook。
 
 ## 执行分工与自动回退
 
@@ -45,7 +47,7 @@ GLM 默认在周一至周五 `14:00–18:00`（`Asia/Shanghai`）切换到 Terra
 - **会话重任务配置**：`STABLE / GLM_FIRST`，只影响 worker/reviewer。
 - **会话轻任务配置**：`LUNA_STABLE / LOCAL_TEXT_FIRST`，只影响 scout/monitor；与重任务配置正交，可同时开启。
 
-自定义 agent 存放在 `~/.codex/agents/`，角色和本地 wrapper 注册在 `~/.codex/config.toml`，都是插件外的 Codex 用户配置。全局关闭插件不会删除它们，但 wrapper 会 fail closed；可运行 `python3 scripts/install_agents.py --disable` 临时停用 agent 与 wrapper，或 `--uninstall` 安全卸载本插件管理的文件与配置片段。
+自定义 agent 存放在 `~/.codex/agents/`，版本化运行包与稳定入口位于 `~/.codex/smart-router/runtime-releases/` 和 `runtime-current`，角色和本地 wrapper 注册在 `~/.codex/config.toml`，都是插件外的 Codex 用户配置。全局关闭插件不会删除它们，但 wrapper 会 fail closed；可运行 `python3 scripts/install_agents.py --disable` 临时停用 agent 与 wrapper，或 `--uninstall` 安全卸载仍与安装哈希一致的受管文件与配置片段。
 
 ## 设计边界
 

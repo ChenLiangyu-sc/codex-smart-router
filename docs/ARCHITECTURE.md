@@ -24,7 +24,7 @@ receipt 的数组数量和字段长度有界，但 findings/evidence 为完整�
 
 若 Codex 在某条失败路径漏发 `PostToolUse`，下一次 `UserPromptSubmit` 只会在 OS 锁证明没有 writer 运行时清理其 MCP 租约；锁仍被占用时保持 fail-closed。安装新版本后，无调用 ID 的 v0.1 遗留租约会被视为不可归属状态并安全清除。
 
-安装器在 `[agents]` 下注册六个 `config_file`，并以绝对路径注册 `[mcp_servers.smart_router]`。它使用带标记的最小配置片段、安装前备份和哈希所有权，卸载时只移除仍完全匹配的受管内容。
+安装器在 `[agents]` 下注册六个 `config_file`，先把运行 hook/MCP 所需的脚本、schema 与 agent 定义写成不可变完整包 `~/.codex/smart-router/runtime-releases/<content-id>/`，校验后通过同目录临时符号链接和 `os.replace` 原子切换 `runtime-current`；`[mcp_servers.smart_router]` 与 hook 都使用该稳定入口。这样任一调用只会看到完整的旧包或完整的新包，不会混用逐文件更新中的版本；两个安装进程同时发布相同 content id 时，后到者只接受已发布包的完整哈希匹配并清理自身 staging。hook 只接受 `runtime-current` 指向 `runtime-releases/<20 位十六进制 id>` 的受管形态，稳定入口无效或缺失时回退当前 `$PLUGIN_ROOT`；两者均缺失或 Python 执行失败则退出 0、静默放行主会话。安装器拒绝管理根、release 根及包内任一中间路径上的符号链接，依靠哈希所有权保护不可变包；卸载先完整预检 agent、配置与 runtime，存在冲突时不删除任何一项。升级前已载入旧版本 hook 命令的会话仍需重开，因为磁盘安装无法改写其内存中的命令。
 
 状态和遥测默认位于 Codex 分配的 `$PLUGIN_DATA`。若环境没有该变量，则退回 `~/.codex/plugin-data/codex-smart-router/`。状态文件按会话 ID 的 SHA-256 保存，避免把 ID 暴露在文件名中。
 
