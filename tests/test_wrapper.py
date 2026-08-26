@@ -89,6 +89,47 @@ class WrapperTests(unittest.TestCase):
                 run_agent.run_task("router_worker", "部署生产数据库迁移")
             run.assert_not_called()
 
+    def test_semantic_multimodal_requires_images_and_forces_terra(self):
+        task = "分析截图内容并列出视觉缺陷"
+        with mock.patch("run_agent.subprocess.run") as run:
+            with self.assertRaisesRegex(ValueError, "require at least one local image"):
+                run_agent.run_task(
+                    "router_reviewer",
+                    task,
+                    execution_profile="GLM_FIRST",
+                    now=dt.datetime(2026, 8, 27, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                )
+            run.assert_not_called()
+
+        def fake_invoke(role, prompt, executor, workspace, timeout, images, env, home, objective_id):
+            self.assertEqual(executor.id, "terra_reviewer")
+            self.assertEqual(len(images), 1)
+            receipt = valid_receipt()
+            receipt["objective_id"] = objective_id
+            return json.dumps(receipt), None, {
+                "input_tokens": 1,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 1,
+                "reasoning_output_tokens": 0,
+                "_stream_kind": "exec_per_turn",
+                "_counter_semantics": "per_turn_sum",
+                "_adapter_version": run_agent.USAGE_ADAPTER_VERSION,
+            }, 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "screen.png"
+            image.write_bytes(b"not-decoded-by-routing-test")
+            with mock.patch("run_agent._invoke", side_effect=fake_invoke):
+                receipt = run_agent.run_task(
+                    "router_reviewer",
+                    task,
+                    execution_profile="GLM_FIRST",
+                    images=[str(image)],
+                    now=dt.datetime(2026, 8, 27, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                )
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_reviewer")
+
     def test_writer_without_positive_authorization_is_rejected_before_subprocess(self):
         with mock.patch("run_agent.subprocess.run") as run:
             with self.assertRaisesRegex(ValueError, "explicit positive write authorization"):
@@ -154,9 +195,66 @@ class WrapperTests(unittest.TestCase):
             receipt = run_agent.run_task("router_scout", "搜索仓库中的测试文件")
         self.assertEqual(
             receipt["_router_meta"]["usage"],
-            {"input_tokens": 120, "cached_input_tokens": 80, "output_tokens": 25},
+            {
+                "input_tokens": 120,
+                "cached_input_tokens": 80,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 25,
+                "reasoning_output_tokens": 0,
+            },
         )
+        self.assertEqual(receipt["_router_meta"]["usage_stream_kind"], "exec_per_turn")
+        self.assertEqual(receipt["_router_meta"]["usage_counter_semantics"], "per_turn_sum")
+        self.assertEqual(receipt["_router_meta"]["usage_adapter_version"], "codex-jsonl-v2")
+        self.assertEqual(receipt["_router_meta"]["attempt_usage"][0]["outcome"], "completed")
         self.assertGreaterEqual(receipt["_router_meta"]["duration_ms"], 0)
+
+    def test_usage_adapter_ignores_repeated_non_turn_snapshots(self):
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "rate_limits.updated",
+                        "usage": {"input_tokens": 999, "cached_input_tokens": 900, "output_tokens": 99},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 120,
+                            "cached_input_tokens": 80,
+                            "cache_write_input_tokens": 20,
+                            "output_tokens": 25,
+                            "reasoning_output_tokens": 7,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "account.updated",
+                        "usage": {"input_tokens": 999, "cached_input_tokens": 900, "output_tokens": 99},
+                    }
+                ),
+            ]
+        )
+        usage = run_agent._stream_usage(stdout)
+        self.assertEqual(usage["input_tokens"], 120)
+        self.assertEqual(usage["cache_write_input_tokens"], 20)
+        self.assertEqual(usage["reasoning_output_tokens"], 7)
+        self.assertEqual(usage["_stream_kind"], "exec_per_turn")
+
+    def test_usage_adapter_uses_last_legacy_snapshot_without_summing(self):
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "legacy", "usage": {"input_tokens": 10, "output_tokens": 1}}),
+                json.dumps({"type": "legacy", "usage": {"input_tokens": 20, "output_tokens": 2}}),
+            ]
+        )
+        usage = run_agent._stream_usage(stdout)
+        self.assertEqual(usage["input_tokens"], 20)
+        self.assertEqual(usage["output_tokens"], 2)
+        self.assertEqual(usage["_counter_semantics"], "last_observed_snapshot")
 
     def test_flat_provider_objects_are_normalized_without_another_model_call(self):
         receipt = valid_receipt()
@@ -198,7 +296,16 @@ class WrapperTests(unittest.TestCase):
                 run_agent.run_task("router_scout", "搜索仓库")
         self.assertEqual(
             raised.exception.usage,
-            {"input_tokens": 37, "cached_input_tokens": 11, "output_tokens": 5},
+            {
+                "input_tokens": 37,
+                "cached_input_tokens": 11,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 5,
+                "reasoning_output_tokens": 0,
+                "_stream_kind": "exec_per_turn",
+                "_counter_semantics": "per_turn_sum",
+                "_adapter_version": "codex-jsonl-v2",
+            },
         )
 
     def test_explicit_objective_id_must_match_receipt(self):
@@ -381,6 +488,20 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(calls, ["glm_reviewer", "terra_reviewer"])
         self.assertEqual(receipt["_router_meta"]["executor"], "terra_reviewer")
         self.assertEqual(receipt["_router_meta"]["fallback_reason"], "glm_receipt_format_failure")
+        self.assertEqual(
+            [item["outcome"] for item in receipt["_router_meta"]["attempt_usage"]],
+            ["receipt_format_failure", "completed"],
+        )
+        self.assertEqual(
+            receipt["_router_meta"]["usage"],
+            {
+                "input_tokens": 5,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 2,
+                "reasoning_output_tokens": 0,
+            },
+        )
 
     def test_glm_format_failure_and_fallback_share_one_deadline(self):
         timeouts = []
@@ -878,6 +999,32 @@ class WrapperTests(unittest.TestCase):
         response = json.loads(stream.getvalue())
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(response["result"]["structuredContent"]["status"], "blocked")
+
+    def test_mcp_fails_closed_when_semantic_multimodal_task_omits_images(self):
+        request = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "route_task",
+                "arguments": {
+                    "decision_id": "0" * 64,
+                    "lease_id": "0" * 32,
+                    "role": "router_reviewer",
+                    "execution_profile": "GLM_FIRST",
+                    "task": "分析截图内容并列出视觉缺陷",
+                },
+            },
+        }
+        stream = io.StringIO()
+        with mock.patch("router_mcp.routing_enabled", return_value=True), mock.patch(
+            "router_mcp.consume_runtime_lease", return_value=True
+        ), mock.patch("run_agent.subprocess.run") as run, redirect_stdout(stream):
+            router_mcp.handle(request)
+        response = json.loads(stream.getvalue())
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("require at least one local image", response["result"]["content"][0]["text"])
+        run.assert_not_called()
 
     def test_mcp_wait_timeout_is_an_error_result(self):
         request = {

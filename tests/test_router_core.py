@@ -29,6 +29,10 @@ class RouterCoreTests(unittest.TestCase):
             "$router-control glm 关闭": "GLM_OFF",
             "$router-control local 开启": "LOCAL_ON",
             "$router-control local 关闭": "LOCAL_OFF",
+            "$router-control 经济策略 v2": "ECON_V2",
+            "/router policy v2": "ECON_V2",
+            "$router-control 经济策略 v1": "ECON_V1",
+            "/router policy v1": "ECON_V1",
         }
         for prompt, expected in cases.items():
             with self.subTest(prompt=prompt):
@@ -197,10 +201,11 @@ class RouterCoreTests(unittest.TestCase):
             router_core._atomic_json(router_core.state_path(root, "s1"), state)
             loaded = router_core.load_state(root, "s1")
             self.assertEqual(loaded["mode"], "ON")
-            self.assertEqual(loaded["schema_version"], 6)
+            self.assertEqual(loaded["schema_version"], 7)
             self.assertIsNone(loaded["current_delegation"])
             self.assertEqual(loaded["execution_profile"], "STABLE")
             self.assertEqual(loaded["light_profile"], "LUNA_STABLE")
+            self.assertEqual(loaded["economics_policy"], "V2_STATIC")
             self.assertEqual(loaded["execution_counts"], {"completed": 0, "failed": 0})
             self.assertEqual(loaded["recent_execution_keys"], [])
 
@@ -288,7 +293,6 @@ class RouterCoreTests(unittest.TestCase):
             "分析所有日志": "router_scout",
             "检查 10 个日志文件": "router_scout",
             "扫描整个仓库": "router_scout",
-            "跨文件复核两个模块": "router_reviewer",
             "合同一致性检查 8 个模块": "router_reviewer",
         }
         for prompt, role in cases.items():
@@ -297,11 +301,128 @@ class RouterCoreTests(unittest.TestCase):
                 self.assertEqual(result["decision"], "DELEGATE", result)
                 self.assertEqual(result["role"], role)
 
-        for prompt in ("读日志", "检查单个日志文件"):
+        for prompt in ("读日志", "检查单个日志文件", "跨文件复核两个模块"):
             with self.subTest(prompt=prompt):
                 result = router_core.classify(prompt, economics=True)
                 self.assertEqual(result["decision"], "INLINE_SOL", result)
-                self.assertIn("routing_overhead", result["reason_codes"])
+                self.assertTrue(
+                    any(code.startswith(("hard_inline:", "static_break_even_proxy:")) for code in result["reason_codes"]),
+                    result,
+                )
+
+    def test_v2_static_uses_tool_fast_paths_and_weak_terms_do_not_force_delegation(self):
+        tool_cases = {
+            "运行现有 pytest 测试": "test_command",
+            "查看 git status": "git_status",
+            "确认路径 /tmp/example/config.toml 是否存在": "path_exists",
+            "统计当前目录的文件数量": "metadata",
+        }
+        for prompt, kind in tool_cases.items():
+            with self.subTest(prompt=prompt):
+                result = router_core.classify(prompt, economics=True)
+                self.assertEqual(result["decision"], "TOOL_ONLY", result)
+                self.assertEqual(result["gate_features"]["deterministic_tool_kind"], kind)
+
+        for prompt in (
+            "扫描这个仓库，看看 manifest",
+            "检查多个路径里的配置",
+            "请独立做一次代码审查",
+            "实现这个单文件小修改",
+        ):
+            with self.subTest(weak_signal=prompt):
+                self.assertEqual(router_core.classify(prompt, economics=True)["decision"], "INLINE_SOL")
+
+    def test_v2_static_profile_thresholds_and_read_only_coalescing(self):
+        stable = router_core.classify("批量盘点 4 个日志文件", economics=True)
+        self.assertEqual(stable["decision"], "DELEGATE", stable)
+        self.assertTrue(stable["gate_features"]["coalesce_candidate"])
+
+        local_small = router_core.classify(
+            "批量盘点 4 个日志文件",
+            economics=True,
+            light_profile="LOCAL_TEXT_FIRST",
+        )
+        self.assertEqual(local_small["decision"], "INLINE_SOL", local_small)
+        local_large = router_core.classify(
+            "批量盘点 8 个日志文件",
+            economics=True,
+            light_profile="LOCAL_TEXT_FIRST",
+        )
+        self.assertEqual(local_large["decision"], "DELEGATE", local_large)
+
+        glm_small = router_core.classify(
+            "合同一致性检查 4 个模块",
+            economics=True,
+            execution_profile="GLM_FIRST",
+        )
+        self.assertEqual(glm_small["decision"], "INLINE_SOL", glm_small)
+        glm_large = router_core.classify(
+            "合同一致性检查 5 个模块",
+            economics=True,
+            execution_profile="GLM_FIRST",
+        )
+        self.assertEqual(glm_large["decision"], "DELEGATE", glm_large)
+
+    def test_v2_static_does_not_double_count_basenames_inside_paths(self):
+        result = router_core.classify(
+            "代码审查 4 个文件： src/a.py src/b.py src/c.py src/d.py",
+            economics=True,
+        )
+        self.assertEqual(result["decision"], "DELEGATE", result)
+        self.assertEqual(result["gate_features"]["unique_path_count"], 4)
+        self.assertEqual(result["gate_features"]["independent_item_count_estimate"], 4)
+
+    def test_v2_multimodal_semantics_are_capability_routed(self):
+        result = router_core.classify("分析截图内容并列出视觉缺陷", economics=True)
+        self.assertEqual(result["decision"], "DELEGATE", result)
+        self.assertEqual(result["role"], "router_reviewer")
+        self.assertIn("gate:multimodal_capability", result["reason_codes"])
+        metadata = router_core.classify("读取图片尺寸和 EXIF", economics=True)
+        self.assertEqual(metadata["decision"], "TOOL_ONLY", metadata)
+        docs_write = router_core.classify(
+            "读取截图内容并更新 4 份文档：a.md b.md c.md d.md",
+            economics=True,
+        )
+        self.assertEqual(docs_write["decision"], "DELEGATE", docs_write)
+        self.assertEqual(docs_write["role"], "router_worker")
+        self.assertTrue(docs_write["write_authorized"])
+        visual_test = router_core.classify(
+            "分析截图内容并运行现有测试",
+            economics=True,
+        )
+        self.assertEqual(visual_test["decision"], "DELEGATE", visual_test)
+        self.assertEqual(visual_test["role"], "router_worker")
+        self.assertTrue(visual_test["gate_features"]["semantic_multimodal"])
+
+    def test_destructive_image_or_file_actions_always_stay_with_sol(self):
+        for prompt in (
+            "删除 /tmp/photos 下的重复图片",
+            "把重复图像删掉，只保留一份",
+            "delete duplicate images from assets/photos",
+            "remove these files after comparing their image content",
+            "实现脚本批量清理 assets/images 下 4 个重复 PNG",
+            "把 assets/images 下 4 个重复 PNG 删除",
+        ):
+            with self.subTest(prompt=prompt):
+                decision = router_core.classify(prompt, economics=True)
+                self.assertEqual(decision["decision"], "INLINE_SOL")
+                self.assertEqual(decision["risk"], "HIGH")
+                self.assertIn("high_risk:destructive", decision["reason_codes"])
+
+        safe_inventory = router_core.classify(
+            "统计图片 sha256 并列出重复项，不要删除任何文件",
+            economics=True,
+        )
+        self.assertEqual(safe_inventory["decision"], "TOOL_ONLY")
+        self.assertEqual(safe_inventory["risk"], "LOW")
+
+    def test_v1_compat_preserves_work_units_gate(self):
+        prompt = "跨文件复核两个模块"
+        v2 = router_core.classify(prompt, economics=True)
+        v1 = router_core.classify(prompt, economics=True, economics_policy="V1_COMPAT")
+        self.assertEqual(v2["decision"], "INLINE_SOL")
+        self.assertEqual(v1["decision"], "DELEGATE")
+        self.assertIn("policy:v1_compat", v1["reason_codes"])
 
     def test_runtime_lease_is_task_bound_and_one_time(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,6 +475,11 @@ class RouterCoreTests(unittest.TestCase):
         self.assertLessEqual(len(inline), 180)
         self.assertIn("INLINE_SOL", inline)
 
+        tool_only = router_core.classify("查看 git status", economics=True)
+        tool_context = router_core.routing_context("ON", tool_only)
+        self.assertIn("TOOL_ONLY", tool_context)
+        self.assertIn("do not spawn", tool_context)
+
         shadow = router_core.routing_context("SHADOW", scout)
         self.assertLessEqual(len(shadow), 240)
         self.assertIn("路由预览：Luna · 只读侦察", shadow)
@@ -362,11 +488,20 @@ class RouterCoreTests(unittest.TestCase):
         worker["decision_id"] = "0" * 64
         glm_shadow = router_core.routing_context("SHADOW", worker, "GLM_FIRST")
         self.assertIn("GLM-5.3 Max / Terra", glm_shadow)
+        tool_shadow = router_core.routing_context("SHADOW", tool_only)
+        self.assertIn("确定性工具 fast path", tool_shadow)
+
+        for prompt in ("批量盘点 8 个日志文件", "分析截图内容并列出视觉缺陷"):
+            with self.subTest(compact_variant=prompt):
+                variant = router_core.classify(prompt, economics=True)
+                variant["decision_id"] = "0" * 64
+                variant["lease_id"] = "1" * 32
+                self.assertLessEqual(len(router_core.routing_context("ON", variant)), 512)
 
     def test_routing_economics_keeps_tightly_coupled_work_inline(self):
         small = router_core.classify("请独立做一次代码审查", economics=True)
         self.assertEqual(small["decision"], "INLINE_SOL")
-        self.assertIn("routing_overhead", small["reason_codes"])
+        self.assertIn("hard_inline:micro_task", small["reason_codes"])
 
         batch = router_core.classify("搜索当前仓库并批量盘点所有日志和 manifest", economics=True)
         self.assertEqual(batch["decision"], "DELEGATE")
@@ -391,6 +526,17 @@ class RouterCoreTests(unittest.TestCase):
             state = router_core.set_light_profile(root, "s1", "LUNA_STABLE")
             self.assertEqual(state["mode"], "ON")
             self.assertEqual(state["light_profile"], "LUNA_STABLE")
+
+    def test_economics_policy_persists_without_changing_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            router_core.set_mode(root, "s1", "ON")
+            state = router_core.set_economics_policy(root, "s1", "V1_COMPAT")
+            self.assertEqual(state["mode"], "ON")
+            self.assertEqual(state["economics_policy"], "V1_COMPAT")
+            state = router_core.set_economics_policy(root, "s1", "V2_STATIC")
+            self.assertEqual(state["mode"], "ON")
+            self.assertEqual(router_core.load_state(root, "s1")["economics_policy"], "V2_STATIC")
 
 
 if __name__ == "__main__":

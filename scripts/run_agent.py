@@ -69,6 +69,14 @@ ROLE_SETTINGS = {
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NON_TOOL_ITEM_TYPES = {"agent_message", "reasoning", "error", "todo_list"}
 MAX_COVERAGE_COUNT = 1_000_000
+USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+USAGE_ADAPTER_VERSION = "codex-jsonl-v2"
 
 
 class ChildFailure(RuntimeError):
@@ -77,13 +85,13 @@ class ChildFailure(RuntimeError):
         detail: str,
         *,
         may_have_mutated: bool = False,
-        usage: dict[str, int] | None = None,
+        usage: dict[str, Any] | None = None,
         duration_ms: int = 0,
     ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.may_have_mutated = may_have_mutated
-        self.usage = usage or {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        self.usage = usage or {name: 0 for name in USAGE_TOKEN_FIELDS}
         self.duration_ms = max(0, duration_ms)
 
 
@@ -277,9 +285,10 @@ def _stream_may_have_mutated(stdout: str) -> bool:
     return _stream_evidence(stdout)[1]
 
 
-def _stream_usage(stdout: str) -> dict[str, int]:
-    """Collect Codex JSONL usage without retaining child reasoning or messages."""
-    totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+def _stream_usage(stdout: str) -> dict[str, Any]:
+    """Normalize Codex JSONL usage without double-counting repeated snapshots."""
+    turn_usages: list[dict[str, Any]] = []
+    observed_usages: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -288,11 +297,35 @@ def _stream_usage(stdout: str) -> dict[str, int]:
         usage = event.get("usage") if isinstance(event, dict) else None
         if not isinstance(usage, dict):
             continue
-        for name in totals:
+        observed_usages.append(usage)
+        if str(event.get("type") or "") == "turn.completed":
+            turn_usages.append(usage)
+    if turn_usages:
+        selected = turn_usages
+        stream_kind = "exec_per_turn"
+        counter_semantics = "per_turn_sum"
+    elif observed_usages:
+        # Older/translated streams may expose cumulative snapshots on several
+        # event types. The last snapshot is safer than summing them all.
+        selected = [observed_usages[-1]]
+        stream_kind = "exec_legacy_last_usage"
+        counter_semantics = "last_observed_snapshot"
+    else:
+        selected = []
+        stream_kind = "unavailable"
+        counter_semantics = "unavailable"
+    totals = {name: 0 for name in USAGE_TOKEN_FIELDS}
+    for usage in selected:
+        for name in USAGE_TOKEN_FIELDS:
             value = usage.get(name)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 totals[name] += value
-    return totals
+    return {
+        **totals,
+        "_stream_kind": stream_kind,
+        "_counter_semantics": counter_semantics,
+        "_adapter_version": USAGE_ADAPTER_VERSION,
+    }
 
 
 def _normalize_receipt_text(raw: str) -> tuple[str, list[str]]:
@@ -603,7 +636,7 @@ def _invoke(
     env_source: Mapping[str, str] | None,
     home: str | Path | None,
     objective_id: str,
-) -> tuple[str, str | None, dict[str, int], int]:
+) -> tuple[str, str | None, dict[str, Any], int]:
     receipt_instruction = (
         "Return a compact JSON object. The wrapper, not you, supplies schema_version and objective_id and converts "
         "this wire object into canonical receipt v2."
@@ -723,6 +756,11 @@ def run_task(
     if role in WRITER_ROLES and not write_authorized_for(task, role):
         raise ValueError("writable role requires explicit positive write authorization")
     image_paths = validate_images(images)
+    semantic_multimodal = bool((safety.get("gate_features") or {}).get("semantic_multimodal"))
+    if semantic_multimodal and not image_paths:
+        raise ValueError("semantic multimodal tasks require at least one local image path")
+    if semantic_multimodal and role not in {"router_worker", "router_reviewer"}:
+        raise ValueError("semantic multimodal tasks require a Terra-capable worker or reviewer role")
     if image_paths and role in {"router_scout", "router_monitor", "router_tester", "router_docs"}:
         raise ValueError("image inputs require a Terra-capable worker or reviewer role")
     target_workspace = (Path(workspace) if workspace is not None else Path.cwd()).expanduser().resolve()
@@ -738,7 +776,8 @@ def run_task(
     attempts: list[str] = []
     receipt_normalizations: list[str] = []
     receipt_format_error: str | None = None
-    usage_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    usage_total = {name: 0 for name in USAGE_TOKEN_FIELDS}
+    attempt_usage: list[dict[str, Any]] = []
     duration_ms = 0
     fallback_reason = (
         resolution.reason
@@ -806,11 +845,45 @@ def run_task(
             duration_ms += exc.duration_ms
             for name in usage_total:
                 usage_total[name] += int(exc.usage.get(name, 0))
+            attempt_usage.append(
+                {
+                    "executor": executor.id,
+                    "outcome": "runtime_failure",
+                    "usage": {name: int(exc.usage.get(name, 0)) for name in USAGE_TOKEN_FIELDS},
+                    "usage_stream_kind": exc.usage.get("_stream_kind", "unavailable"),
+                    "usage_counter_semantics": exc.usage.get("_counter_semantics", "unavailable"),
+                    "duration_ms": exc.duration_ms,
+                }
+            )
             raise
         duration_ms += elapsed
         for name in usage_total:
             usage_total[name] += int(usage.get(name, 0))
-        return prepare_receipt(raw, executor), key
+        try:
+            prepared = prepare_receipt(raw, executor)
+        except ReceiptFormatFailure:
+            attempt_usage.append(
+                {
+                    "executor": executor.id,
+                    "outcome": "receipt_format_failure",
+                    "usage": {name: int(usage.get(name, 0)) for name in USAGE_TOKEN_FIELDS},
+                    "usage_stream_kind": usage.get("_stream_kind", "unavailable"),
+                    "usage_counter_semantics": usage.get("_counter_semantics", "unavailable"),
+                    "duration_ms": elapsed,
+                }
+            )
+            raise
+        attempt_usage.append(
+            {
+                "executor": executor.id,
+                "outcome": "completed",
+                "usage": {name: int(usage.get(name, 0)) for name in USAGE_TOKEN_FIELDS},
+                "usage_stream_kind": usage.get("_stream_kind", "unavailable"),
+                "usage_counter_semantics": usage.get("_counter_semantics", "unavailable"),
+                "duration_ms": elapsed,
+            }
+        )
+        return prepared, key
 
     def execute_with_fallback() -> tuple[str, ExecutorSpec, str | None]:
         nonlocal receipt_format_error
@@ -918,6 +991,18 @@ def run_task(
         "fallback_reason": actual_fallback_reason,
         "attempted_executors": attempts,
         "usage": usage_total,
+        "usage_stream_kind": (
+            attempt_usage[0]["usage_stream_kind"]
+            if attempt_usage and len({item["usage_stream_kind"] for item in attempt_usage}) == 1
+            else "mixed"
+        ),
+        "usage_counter_semantics": (
+            attempt_usage[0]["usage_counter_semantics"]
+            if attempt_usage and len({item["usage_counter_semantics"] for item in attempt_usage}) == 1
+            else "mixed"
+        ),
+        "usage_adapter_version": USAGE_ADAPTER_VERSION,
+        "attempt_usage": attempt_usage,
         "duration_ms": duration_ms,
         "receipt_normalizations": receipt_normalizations,
         "receipt_format_error": receipt_format_error,

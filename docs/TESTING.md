@@ -38,3 +38,13 @@ v0.4.1 针对 GLM 官方端点与 MAAS 中转不保证 OpenAI strict Structured 
 安装 `0.4.1+codex.20260826055427` 并切换 `runtime-current` 后，又从稳定 runtime 入口执行了一次官方 GLM reviewer：106 秒内一次完成，adapter 规范化 status、扁平 findings/inconsistencies 和 coverage scope，`receipt_format_error=null`，没有 Terra fallback。该任务同时发现新 schema 在提交前仍是 untracked 文件；发布流程随后必须把它纳入 Git commit，不能只依赖本机 cache。
 
 v0.4.1 安装器补丁恢复同步 MCP 的 `tool_timeout_sec = 1200`，并为 Codex 写入 managed markers 内的 `hooks.state` trusted hashes 增加窄范围兼容解析。回归覆盖：幂等安装与按内网报告冻结的 v0.4.0 已安装配置 fixture 在升级预览中不删除长超时、reinstall/uninstall/check-uninstall 保留合法 hook 状态、非 hooks 漂移仍 fail closed 且阻断整套卸载，以及 GLM 与 DeepSeek 同时配置时两个 API key 均进入子进程 shell 排除列表。
+
+### v0.4.2-alpha 经济门回归记录
+
+v0.4.2-alpha 引入默认 `V2_STATIC` 和会话级 `V1_COMPAT` kill switch。回归覆盖 TOOL_ONLY、弱词不直接委派、Luna/Local/GLM 规模门、4–12 项只读合并提示、路径与 basename 去重、破坏性图片/文件操作留 Sol、语义多模态无图 fail closed/有图强制 Terra，以及 `turn.completed`/legacy snapshot/fallback attempt 的 usage 口径。
+
+发布候选的自动化套件为 167/167 通过，plugin 和 router-control skill validator 均通过。单次综合 subagent review 发现的混合语言删除漏判、MCP/runtime 多模态旁路和 docs/tester 角色优先级问题已修复，窄范围复核无剩余 finding。
+
+四个用户项目的预注册矩阵共 20 个场景：`jd-resume-optimizer`、`ppt_notes_pipeline_server-1.0.9`、`flash-sale-assistant`、`web-auto-translate-extension`。使用 `SMART_ROUTER_EVAL_WORKSPACE_ROOT=/home/chenliangyu/workspace` 时，测试会同时确认 fixture 引用的真实项目路径存在；该矩阵检查分类而不伪称执行 20 次模型任务。
+
+2026-08-26 对 `jd-resume-optimizer` 执行了一次真实 Luna scout：只读检查 4/4 个 optimization-runtime 文件，47.953 秒内返回合法 receipt v2，无写入。usage adapter 记录 `input=56006`、`cached_input=32256`、`cache_write=0`、`output=1908`、`reasoning=422`，口径为 `exec_per_turn/per_turn_sum`。这一单例证明 child startup 可能很大，但不足以校准 P75/P50；主 Sol inline token 和 parent verification token 仍明确标为 unavailable。

@@ -12,14 +12,34 @@ from provider_policy import (
     PROFILE_GLM_FIRST,
     PROFILE_STABLE,
 )
-from router_core import classify, data_root, load_state, set_execution_profile, set_light_profile, set_mode
+from router_core import (
+    classify,
+    data_root,
+    load_state,
+    set_economics_policy,
+    set_execution_profile,
+    set_light_profile,
+    set_mode,
+)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect or change Codex Smart Router state")
     parser.add_argument(
         "command",
-        choices=("status", "on", "shadow", "off", "glm-on", "glm-off", "local-on", "local-off", "route"),
+        choices=(
+            "status",
+            "on",
+            "shadow",
+            "off",
+            "glm-on",
+            "glm-off",
+            "local-on",
+            "local-off",
+            "economics-v1",
+            "economics-v2",
+            "route",
+        ),
     )
     parser.add_argument("--session-id", required=True, help="Codex session id")
     parser.add_argument("--data-dir", help="Override plugin data directory")
@@ -40,10 +60,28 @@ def main() -> int:
         state = set_light_profile(root, args.session_id, profile, activate=args.command == "local-on")
         print(json.dumps(state, ensure_ascii=False, indent=2))
         return 0
+    if args.command in {"economics-v1", "economics-v2"}:
+        policy = "V1_COMPAT" if args.command == "economics-v1" else "V2_STATIC"
+        state = set_economics_policy(root, args.session_id, policy)
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "route":
         if not args.prompt:
             parser.error("route requires --prompt")
-        print(json.dumps(classify(args.prompt, economics=True), ensure_ascii=False, indent=2))
+        state = load_state(root, args.session_id)
+        print(
+            json.dumps(
+                classify(
+                    args.prompt,
+                    economics=True,
+                    economics_policy=state["economics_policy"],
+                    execution_profile=state["execution_profile"],
+                    light_profile=state["light_profile"],
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     print(json.dumps(load_state(root, args.session_id), ensure_ascii=False, indent=2))
     return 0

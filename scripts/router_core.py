@@ -25,6 +25,8 @@ from provider_policy import (
 
 PLUGIN_ID = "codex-smart-router"
 MODES = {"OFF", "SHADOW", "ON"}
+ECONOMICS_POLICIES = {"V1_COMPAT", "V2_STATIC"}
+DEFAULT_ECONOMICS_POLICY = "V2_STATIC"
 ROLES = {
     "router_scout",
     "router_worker",
@@ -98,6 +100,10 @@ SECURITY_AUTHORIZATION_ACTION = re.compile(
 )
 
 CONTROL_PATTERNS = (
+    (re.compile(r"\$router-control\s*(?:经济策略\s*)?(?:v2|保守|static)\b", re.I), "ECON_V2"),
+    (re.compile(r"/router\s+policy\s+v2\b", re.I), "ECON_V2"),
+    (re.compile(r"\$router-control\s*(?:经济策略\s*)?(?:v1|兼容|compat)\b", re.I), "ECON_V1"),
+    (re.compile(r"/router\s+policy\s+v1\b", re.I), "ECON_V1"),
     (re.compile(r"\$router-control\s*(?:local\s*(?:开启|启用|on)|(?:开启|启用)\s*local)\b", re.I), "LOCAL_ON"),
     (re.compile(r"/router\s+local\s+on\b", re.I), "LOCAL_ON"),
     (re.compile(r"\$router-control\s*(?:local\s*(?:关闭|停用|off)|(?:关闭|停用)\s*local)\b", re.I), "LOCAL_OFF"),
@@ -180,6 +186,145 @@ BATCH_TERMS = (
 PATH_SIGNAL = re.compile(r"(?:^|\s)(?:\.?\.?/|/)[^\s，。；;]+|\b[\w.-]+/(?:[\w./-]+)")
 COUNT_SIGNAL = re.compile(r"(?<!\d)(?:[3-9]|[1-9]\d+)\s*(?:个|项|份|组|files?|modules?|cases?)", re.I)
 COMPLEX_REVIEW_TERMS = ("跨文件", "跨模块", "合同一致性", "缺陷归因", "cross-file", "cross module", "contract")
+
+STRONG_BATCH_TERMS = (
+    "批量",
+    "所有日志",
+    "全部日志",
+    "所有文件",
+    "全部文件",
+    "整仓",
+    "全仓",
+    "整个仓库",
+    "整个目录",
+    "测试套件",
+    "batch",
+    "all files",
+    "entire repository",
+    "whole repository",
+    "test suite",
+)
+SINGLE_SCOPE_TERMS = (
+    "单个文件",
+    "一个文件",
+    "这个文件",
+    "当前文件",
+    "单文件",
+    "single file",
+    "this file",
+)
+FILE_SIGNAL = re.compile(
+    r"(?<![\w.-])(?:README|CHANGELOG|LICENSE)(?:\.[\w.-]+)?\b|"
+    r"(?<![\w.-])[\w.-]+\.(?:py|js|jsx|ts|tsx|json|toml|ya?ml|md|txt|log|html|css|sql)\b",
+    re.I,
+)
+COUNT_VALUE_SIGNAL = re.compile(
+    r"(?<!\d)(\d{1,3})\s*(?:个|项|份|组|files?\b|modules?\b|cases?\b|tests?\b|logs?\b)",
+    re.I,
+)
+CHINESE_COUNT_TERMS = {"一个": 1, "单个": 1, "两个": 2, "三个": 3, "四个": 4, "五个": 5, "六个": 6, "七个": 7, "八个": 8, "九个": 9}
+
+DETERMINISTIC_TOOL_PATTERNS = (
+    (
+        "path_exists",
+        re.compile(
+            r"(?:文件|路径|目录).{0,100}(?:是否存在|存在吗)|"
+            r"(?:[\w./-]+\.[\w.-]+)[^\u3002；;\n]{0,80}(?:是否存在|存在吗)|"
+            r"does\s+(?:this\s+)?(?:file|path|directory)\s+exist",
+            re.I,
+        ),
+    ),
+    (
+        "exact_search",
+        re.compile(r"(?:精确搜索|查找字符串|搜索键名|查找键名|查找引用|\brg\b|exact\s+search)", re.I),
+    ),
+    (
+        "metadata",
+        re.compile(r"(?:统计文件数|文件数量|文件个数|行数|sha-?256|哈希|hash|exif|图片尺寸|图像尺寸|页面数|页数)", re.I),
+    ),
+    (
+        "git_status",
+        re.compile(r"(?:git\s+(?:status|diff\s+--stat|log)|查看\s*git\s*状态|diff\s*统计)", re.I),
+    ),
+    (
+        "schema_validation",
+        re.compile(r"(?:校验|验证|validate).{0,24}(?:json|ya?ml|toml|schema)", re.I),
+    ),
+    (
+        "test_command",
+        re.compile(
+            r"(?:运行|执行|跑一下|run)[^\u3002；;\n]{0,160}"
+            r"(?:现有)?(?:测试|pytest|unittest|npm\s+test|pnpm\s+test|yarn\s+test|lint|typecheck|build)",
+            re.I,
+        ),
+    ),
+)
+SEMANTIC_TOOL_BLOCKERS = (
+    "分析失败",
+    "缺陷归因",
+    "解释原因",
+    "总结原因",
+    "修复",
+    "实现",
+    "修改",
+    "重构",
+    "评估质量",
+    "提出建议",
+    "root cause",
+    "explain why",
+    "fix",
+    "implement",
+    "refactor",
+)
+MULTIMODAL_METADATA_TERMS = ("图片尺寸", "图像尺寸", "exif", "图片格式", "页面数", "页数", "哈希", "hash")
+MULTIMODAL_SEMANTIC_TERMS = (
+    "图片内容",
+    "图像内容",
+    "截图内容",
+    "识别图片",
+    "分析图片",
+    "分析截图",
+    "视觉分析",
+    "ppt 页面内容",
+    "幻灯片内容",
+    "image content",
+    "analyze image",
+    "screenshot content",
+    "visual review",
+)
+DESTRUCTIVE_FILE_TARGET = (
+    r"(?:图片|图像|截图|文件|目录|路径|"
+    r"images?|pictures?|screenshots?|files?|director(?:y|ies)|paths?|assets?|"
+    r"png|jpe?g|gif|webp|svg|pdf|"
+    r"[\w.-]+/[\w./-]+)"
+)
+DESTRUCTIVE_FILE_ACTION_PATTERNS = (
+    re.compile(
+        rf"(?:删除|删掉|移除|清理|delete|remove)[^。；;\n]{{0,64}}{DESTRUCTIVE_FILE_TARGET}",
+        re.I,
+    ),
+    re.compile(
+        rf"{DESTRUCTIVE_FILE_TARGET}[^。；;\n]{{0,64}}(?:删除|删掉|移除|清理|delete|remove)",
+        re.I,
+    ),
+)
+DESTRUCTIVE_ACTION_TERM = re.compile(r"删除|删掉|移除|清理|delete|remove", re.I)
+
+ROLE_MIN_ITEMS = {
+    "router_scout": 4,
+    "router_reviewer": 4,
+    "router_worker": 4,
+    "router_tester": 4,
+    "router_docs": 4,
+}
+ROLE_PARENT_REVIEW_CAP = {
+    "router_scout": 0.30,
+    "router_reviewer": 0.35,
+    "router_worker": 0.35,
+    "router_tester": 0.30,
+    "router_docs": 0.30,
+    "router_monitor": 0.0,
+}
 
 WRITE_INTENT_PATTERNS = {
     "router_worker": (
@@ -346,11 +491,12 @@ def consume_runtime_lease(
 def default_state(session_id: str) -> dict[str, Any]:
     now = int(time.time())
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "session_key": session_key(session_id),
         "mode": "OFF",
         "execution_profile": PROFILE_STABLE,
         "light_profile": LIGHT_PROFILE_LUNA_STABLE,
+        "economics_policy": DEFAULT_ECONOMICS_POLICY,
         "created_at": now,
         "updated_at": now,
         "last_decision": None,
@@ -391,11 +537,15 @@ def load_state(root: Path, session_id: str) -> dict[str, Any]:
         return default_state(session_id)
     # Additive migration keeps an existing session's mode while enabling newer
     # user-facing execution history.
-    state["schema_version"] = 6
+    state["schema_version"] = 7
     profile = str(state.get("execution_profile") or PROFILE_STABLE).upper()
     state["execution_profile"] = profile if profile in EXECUTION_PROFILES else PROFILE_STABLE
     light_profile = str(state.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
     state["light_profile"] = light_profile if light_profile in LIGHT_PROFILES else LIGHT_PROFILE_LUNA_STABLE
+    economics_policy = str(state.get("economics_policy") or DEFAULT_ECONOMICS_POLICY).upper()
+    state["economics_policy"] = (
+        economics_policy if economics_policy in ECONOMICS_POLICIES else DEFAULT_ECONOMICS_POLICY
+    )
     counts = state.get("execution_counts")
     if not isinstance(counts, dict):
         counts = {}
@@ -487,6 +637,18 @@ def set_light_profile(
     return state
 
 
+def set_economics_policy(root: Path, session_id: str, policy: str) -> dict[str, Any]:
+    normalized = policy.upper()
+    if normalized not in ECONOMICS_POLICIES:
+        raise ValueError(f"unsupported economics policy: {policy}")
+    state = load_state(root, session_id)
+    state["economics_policy"] = normalized
+    state["last_decision"] = None
+    state["repair_attempts"] = 0
+    save_state(root, session_id, state)
+    return state
+
+
 def parse_control(prompt: str) -> str | None:
     normalized = " ".join(prompt.strip().split()).rstrip("。.!！")
     for pattern, action in CONTROL_PATTERNS:
@@ -546,6 +708,17 @@ def _explicit_read_only(text: str) -> bool:
 def _risk_reasons(text: str) -> list[str]:
     scoped = ROUTING_AUTHORIZATION_METADATA.sub("", text)
     reasons = [f"high_risk:{code}" for code, terms in HIGH_RISK.items() if _matches(scoped, terms)]
+    destructive_action = False
+    for pattern in DESTRUCTIVE_FILE_ACTION_PATTERNS:
+        for match in pattern.finditer(scoped):
+            action = DESTRUCTIVE_ACTION_TERM.search(match.group(0))
+            if action and not _is_negated(scoped, match.start() + action.start()):
+                destructive_action = True
+                break
+        if destructive_action:
+            break
+    if destructive_action and "high_risk:destructive" not in reasons:
+        reasons.append("high_risk:destructive")
     if SECURITY_AUTHORIZATION_ACTION.search(scoped) and "high_risk:security" not in reasons:
         reasons.append("high_risk:security")
     return reasons
@@ -556,14 +729,307 @@ def write_authorized_for(prompt: str, role: str) -> bool:
     if role not in WRITER_ROLES:
         return False
     text = " ".join(prompt.lower().split())
+    role_matches = _write_intent_matches(text, role)
+    # Terra's writable multimodal lane is router_worker. A user may explicitly
+    # request a docs/test change based on image semantics; preserve that positive
+    # write authorization when remapping away from text-only Luna roles.
+    if role == "router_worker" and any(term in text for term in MULTIMODAL_SEMANTIC_TERMS):
+        role_matches.extend(_write_intent_matches(text, "router_docs"))
+        role_matches.extend(_write_intent_matches(text, "router_tester"))
     return (
         not _risk_reasons(text)
         and not _explicit_read_only(text)
-        and bool(_write_intent_matches(text, role))
+        and bool(role_matches)
     )
 
 
-def classify(prompt: str, *, economics: bool = False) -> dict[str, Any]:
+def _deterministic_tool_kind(text: str) -> str | None:
+    if any(term in text for term in SEMANTIC_TOOL_BLOCKERS):
+        return None
+    for kind, pattern in DETERMINISTIC_TOOL_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return None
+
+
+def _economic_features(text: str, role: str, found: list[str]) -> dict[str, Any]:
+    batch_hits = _matches(text, BATCH_TERMS)
+    strong_batch_hits = _matches(text, STRONG_BATCH_TERMS)
+    legacy_path_hits = PATH_SIGNAL.findall(text)
+    legacy_count_hits = COUNT_SIGNAL.findall(text)
+    path_matches = list(PATH_SIGNAL.finditer(text))
+    paths = {match.group(0).strip() for match in path_matches}
+    for file_match in FILE_SIGNAL.finditer(text):
+        # A path regex already owns its basename. Counting the nested filename
+        # again made four explicit paths look like eight independent items.
+        if any(
+            path_match.start() <= file_match.start() and file_match.end() <= path_match.end()
+            for path_match in path_matches
+        ):
+            continue
+        paths.add(file_match.group(0).strip())
+    numeric_counts = [int(match.group(1)) for match in COUNT_VALUE_SIGNAL.finditer(text)]
+    chinese_counts = [value for term, value in CHINESE_COUNT_TERMS.items() if term in text]
+    explicit_item_count = max([0, *numeric_counts, *chinese_counts])
+    complex_review_hits = _matches(text, COMPLEX_REVIEW_TERMS) if role == "router_reviewer" else []
+    broad_floor = 0
+    if strong_batch_hits:
+        broad_floor = 4
+        if any(
+            marker in text
+            for marker in (
+                "所有日志",
+                "全部日志",
+                "所有文件",
+                "全部文件",
+                "整仓",
+                "全仓",
+                "整个仓库",
+                "entire repository",
+                "whole repository",
+                "all files",
+            )
+        ):
+            broad_floor = 8
+    estimated_items = max(len(paths), explicit_item_count, broad_floor)
+    deterministic_kind = _deterministic_tool_kind(text)
+    semantic_multimodal = any(term in text for term in MULTIMODAL_SEMANTIC_TERMS)
+    single_scope = any(term in text for term in SINGLE_SCOPE_TERMS) or (
+        len(paths) == 1 and explicit_item_count <= 1 and not strong_batch_hits
+    )
+    micro_task = bool(deterministic_kind) or (
+        (single_scope or estimated_items <= 1)
+        and not strong_batch_hits
+        and not complex_review_hits
+        and not semantic_multimodal
+    )
+    writer = role in WRITER_ROLES
+    independent_bounded_package = bool(
+        role == "router_monitor"
+        or semantic_multimodal
+        or len(paths) >= 2
+        or explicit_item_count >= 2
+        or (strong_batch_hits and not writer)
+        or (complex_review_hits and estimated_items >= 2)
+    )
+    if deterministic_kind or micro_task:
+        sol_turn_bucket = "1-3"
+    elif estimated_items >= 4 or semantic_multimodal:
+        sol_turn_bucket = "4+"
+    else:
+        sol_turn_bucket = "unknown"
+    legacy_work_units = min(
+        12,
+        1
+        + len(found)
+        + min(4, len(batch_hits) * 2)
+        + min(3, len(legacy_path_hits))
+        + min(3, len(legacy_count_hits) * 2)
+        + min(2, len(complex_review_hits) * 2)
+        + (1 if len(text) >= 160 else 0),
+    )
+    return {
+        "candidate_role": role,
+        "deterministic_tool_possible": bool(deterministic_kind),
+        "deterministic_tool_kind": deterministic_kind,
+        "semantic_multimodal": semantic_multimodal,
+        "single_scope": single_scope,
+        "micro_task": micro_task,
+        "strong_batch": bool(strong_batch_hits),
+        "strong_batch_signals": strong_batch_hits[:4],
+        "unique_path_count": len(paths),
+        "explicit_item_count": explicit_item_count,
+        "independent_item_count_estimate": estimated_items,
+        "estimated_sol_turns": sol_turn_bucket,
+        "independent_bounded_package": independent_bounded_package,
+        "coalesce_candidate": (
+            role in {"router_scout", "router_reviewer"} and 4 <= estimated_items <= 12
+        ),
+        "work_units_legacy": legacy_work_units,
+    }
+
+
+def _inline_candidate(
+    role: str,
+    features: dict[str, Any],
+    *reason_codes: str,
+    confidence: float = 0.94,
+) -> dict[str, Any]:
+    return {
+        "decision": "INLINE_SOL",
+        "role": None,
+        "risk": "LOW",
+        "confidence": confidence,
+        "reason_codes": [*reason_codes, f"candidate:{role}"],
+        "write_authorized": False,
+        "estimated_work_units": features["work_units_legacy"],
+        "estimated_parent_review_ratio": 1.0,
+        "task_bucket": "micro_query" if features["micro_task"] else "uncertain_scope",
+        "gate_features": features,
+        "cost_estimate_status": "cold_start_static_proxy",
+    }
+
+
+def _v1_economic_decision(
+    role: str,
+    found: list[str],
+    reasons: list[str],
+    write_authorized: bool,
+    features: dict[str, Any],
+    count: int,
+) -> dict[str, Any]:
+    work_units = int(features["work_units_legacy"])
+    if role != "router_monitor" and work_units < 4:
+        return _inline_candidate(role, features, "routing_overhead", f"work_units:{work_units}", confidence=0.9)
+    expected_review_ratio = round(min(0.3, 1.0 / max(4, work_units)), 2)
+    reasons.extend([f"work_units:{work_units}", f"review_ratio:{expected_review_ratio:.2f}", "policy:v1_compat"])
+    return {
+        "decision": "DELEGATE",
+        "role": role,
+        "risk": "LOW",
+        "confidence": min(0.96, 0.78 + 0.06 * count),
+        "reason_codes": reasons,
+        "write_authorized": write_authorized,
+        "estimated_work_units": work_units,
+        "estimated_parent_review_ratio": expected_review_ratio,
+        "task_bucket": _task_bucket(role, features),
+        "gate_features": features,
+        "cost_estimate_status": "legacy_work_units",
+    }
+
+
+def _task_bucket(role: str, features: dict[str, Any]) -> str:
+    if features.get("semantic_multimodal"):
+        return "multimodal"
+    if features.get("deterministic_tool_possible"):
+        return "deterministic_tool"
+    return {
+        "router_scout": "batch_read",
+        "router_reviewer": "review",
+        "router_worker": "implementation",
+        "router_tester": "test",
+        "router_docs": "docs",
+        "router_monitor": "deterministic_wait",
+    }.get(role, "uncertain")
+
+
+def _v2_economic_decision(
+    role: str,
+    reasons: list[str],
+    write_authorized: bool,
+    features: dict[str, Any],
+    count: int,
+    execution_profile: str,
+    light_profile: str,
+) -> dict[str, Any]:
+    if role == "router_monitor":
+        reasons.extend(["gate:deterministic_wait", "policy:v2_static"])
+        return {
+            "decision": "DELEGATE",
+            "role": role,
+            "risk": "LOW",
+            "confidence": 0.96,
+            "reason_codes": reasons,
+            "write_authorized": False,
+            "estimated_work_units": features["work_units_legacy"],
+            "estimated_parent_review_ratio": 0.0,
+            "task_bucket": "deterministic_wait",
+            "gate_features": features,
+            "cost_estimate_status": "tool_only_wait",
+        }
+    if features["semantic_multimodal"] and role in {"router_worker", "router_reviewer"}:
+        reasons.extend(["gate:multimodal_capability", "policy:v2_static"])
+        return {
+            "decision": "DELEGATE",
+            "role": role,
+            "risk": "LOW",
+            "confidence": 0.94,
+            "reason_codes": reasons,
+            "write_authorized": write_authorized,
+            "estimated_work_units": features["work_units_legacy"],
+            "estimated_parent_review_ratio": ROLE_PARENT_REVIEW_CAP[role],
+            "task_bucket": "multimodal",
+            "gate_features": features,
+            "cost_estimate_status": "capability_route",
+        }
+    if features["deterministic_tool_possible"]:
+        kind = str(features["deterministic_tool_kind"])
+        return {
+            "decision": "TOOL_ONLY",
+            "role": None,
+            "risk": "LOW",
+            "confidence": 0.97,
+            "reason_codes": [f"deterministic_tool:{kind}", f"candidate:{role}", "policy:v2_static"],
+            "write_authorized": False,
+            "estimated_work_units": features["work_units_legacy"],
+            "estimated_parent_review_ratio": 0.0,
+            "task_bucket": "deterministic_tool",
+            "gate_features": features,
+            "cost_estimate_status": "tool_fast_path",
+        }
+    if features["micro_task"]:
+        return _inline_candidate(role, features, "hard_inline:micro_task", "policy:v2_static")
+    if not features["independent_bounded_package"]:
+        return _inline_candidate(role, features, "hard_inline:no_bounded_package", "policy:v2_static", confidence=0.9)
+    if role in WRITER_ROLES and features["strong_batch"] and not (
+        features["unique_path_count"] >= 2 or features["explicit_item_count"] >= 2
+    ):
+        return _inline_candidate(role, features, "hard_inline:unbounded_write_scope", "policy:v2_static")
+
+    minimum_items = ROLE_MIN_ITEMS.get(role, 4)
+    if light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and role == "router_scout":
+        minimum_items = 8
+    if execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
+        minimum_items = 5
+    estimated_items = int(features["independent_item_count_estimate"])
+    if estimated_items < minimum_items or features["estimated_sol_turns"] != "4+":
+        return _inline_candidate(
+            role,
+            features,
+            "static_break_even_proxy:insufficient_scale",
+            f"min_items:{minimum_items}",
+            "policy:v2_static",
+            confidence=0.92,
+        )
+
+    review_cap = ROLE_PARENT_REVIEW_CAP.get(role, 0.35)
+    if light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and role == "router_scout":
+        review_cap = 0.25
+    elif execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
+        review_cap = 0.30
+    reasons.extend(
+        [
+            "gate:bounded_package",
+            f"scale:{estimated_items}",
+            f"review_cap:{review_cap:.2f}",
+            "static_break_even_proxy:pass",
+            "quality_guard:hard_rules",
+            "policy:v2_static",
+        ]
+    )
+    return {
+        "decision": "DELEGATE",
+        "role": role,
+        "risk": "LOW",
+        "confidence": min(0.96, 0.78 + 0.06 * count),
+        "reason_codes": reasons,
+        "write_authorized": write_authorized,
+        "estimated_work_units": features["work_units_legacy"],
+        "estimated_parent_review_ratio": review_cap,
+        "task_bucket": _task_bucket(role, features),
+        "gate_features": features,
+        "cost_estimate_status": "cold_start_static_proxy",
+    }
+
+
+def classify(
+    prompt: str,
+    *,
+    economics: bool = False,
+    economics_policy: str = DEFAULT_ECONOMICS_POLICY,
+    execution_profile: str = PROFILE_STABLE,
+    light_profile: str = LIGHT_PROFILE_LUNA_STABLE,
+) -> dict[str, Any]:
     text = " ".join(prompt.lower().split())
     risk_reasons = _risk_reasons(text)
     if risk_reasons:
@@ -576,6 +1042,20 @@ def classify(prompt: str, *, economics: bool = False) -> dict[str, Any]:
             "write_authorized": False,
         }
 
+    policy = str(economics_policy or DEFAULT_ECONOMICS_POLICY).upper()
+    semantic_multimodal = any(term in text for term in MULTIMODAL_SEMANTIC_TERMS)
+    if economics and policy != "V1_COMPAT" and not semantic_multimodal and _deterministic_tool_kind(text):
+        features = _economic_features(text, "router_scout", [])
+        return _v2_economic_decision(
+            "router_scout",
+            ["category:deterministic_tool"],
+            False,
+            features,
+            1,
+            str(execution_profile).upper(),
+            str(light_profile).upper(),
+        )
+
     matches: list[tuple[str, int, list[str]]] = []
     for role, terms in CATEGORY_TERMS.items():
         found = _positive_matches(text, terms)
@@ -587,6 +1067,11 @@ def classify(prompt: str, *, economics: bool = False) -> dict[str, Any]:
         for role in WRITER_ROLES
         if write_authorized_for(prompt, role)
     }
+    if semantic_multimodal:
+        if "router_worker" in authorized_writers:
+            matches = [("router_worker", 3, ["semantic_multimodal", "multimodal_write"])]
+        else:
+            matches = [("router_reviewer", 2, ["semantic_multimodal"])]
 
     # Least privilege: when a prompt has both a read-only lane and a writer lane
     # without explicit write authorization, discard the writer match. If a writer
@@ -624,33 +1109,21 @@ def classify(prompt: str, *, economics: bool = False) -> dict[str, Any]:
             reasons.append(f"least_privilege_remap:{unauthorized_writers[0][0]}")
         if write_authorized:
             reasons.append("explicit_write_intent")
-        batch_hits = _matches(text, BATCH_TERMS)
-        path_hits = PATH_SIGNAL.findall(text)
-        count_hits = COUNT_SIGNAL.findall(text)
-        complex_review_hits = _matches(text, COMPLEX_REVIEW_TERMS) if role == "router_reviewer" else []
-        work_units = min(
-            12,
-            1
-            + len(found)
-            + min(4, len(batch_hits) * 2)
-            + min(3, len(path_hits))
-            + min(3, len(count_hits) * 2)
-            + min(2, len(complex_review_hits) * 2)
-            + (1 if len(text) >= 160 else 0),
-        )
-        if economics and role != "router_monitor" and work_units < 4:
-            return {
-                "decision": "INLINE_SOL",
-                "role": None,
-                "risk": "LOW",
-                "confidence": 0.9,
-                "reason_codes": ["routing_overhead", f"candidate:{role}", f"work_units:{work_units}"],
-                "write_authorized": False,
-                "estimated_work_units": work_units,
-                "estimated_parent_review_ratio": 1.0,
-            }
-        expected_review_ratio = round(min(0.3, 1.0 / max(4, work_units)), 2)
-        reasons.extend([f"work_units:{work_units}", f"review_ratio:{expected_review_ratio:.2f}"])
+        features = _economic_features(text, role, found)
+        if economics:
+            if policy == "V1_COMPAT":
+                return _v1_economic_decision(role, found, reasons, write_authorized, features, count)
+            return _v2_economic_decision(
+                role,
+                reasons,
+                write_authorized,
+                features,
+                count,
+                str(execution_profile).upper(),
+                str(light_profile).upper(),
+            )
+        expected_review_ratio = ROLE_PARENT_REVIEW_CAP.get(role, 0.35)
+        reasons.extend([f"review_cap:{expected_review_ratio:.2f}"])
         return {
             "decision": "DELEGATE",
             "role": role,
@@ -658,8 +1131,11 @@ def classify(prompt: str, *, economics: bool = False) -> dict[str, Any]:
             "confidence": min(0.96, 0.78 + 0.06 * count),
             "reason_codes": reasons,
             "write_authorized": write_authorized,
-            "estimated_work_units": work_units,
+            "estimated_work_units": features["work_units_legacy"],
             "estimated_parent_review_ratio": expected_review_ratio,
+            "task_bucket": _task_bucket(role, features),
+            "gate_features": features,
+            "cost_estimate_status": "not_requested",
         }
 
     if len(text) < 80:
@@ -849,7 +1325,9 @@ def routing_context(
 ) -> str:
     role = decision.get("role") or "main_sol"
     if mode == "SHADOW":
-        if decision["decision"] != "DELEGATE":
+        if decision["decision"] == "TOOL_ONLY":
+            recommendation = "确定性工具 fast path"
+        elif decision["decision"] != "DELEGATE":
             recommendation = "Sol"
         elif execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
             recommendation = "GLM-5.3 Max / Terra 动态执行"
@@ -860,6 +1338,12 @@ def routing_context(
         return (
             f"SR_SHADOW recommended={role} risk={decision['risk']}. Do not delegate; handle normally in Sol. "
             f'End the answer with exactly: "路由预览：{recommendation}".'
+        )
+    if decision["decision"] == "TOOL_ONLY":
+        kind = str((decision.get("gate_features") or {}).get("deterministic_tool_kind") or "direct_tool")
+        return (
+            f"SR_ON TOOL_ONLY kind={kind} risk={decision['risk']}. "
+            "Handle in Sol with the minimum direct deterministic tool call; do not spawn or call route_task."
         )
     if decision["decision"] != "DELEGATE":
         return f"SR_ON INLINE_SOL risk={decision['risk']}. Do not delegate; handle normally in Sol without a route label."
@@ -872,10 +1356,21 @@ def routing_context(
             "Use smart_router.wait_for_condition exactly once with these IDs; do not spawn an agent or poll. "
             "The MCP call blocks deterministically until the condition, timeout, or cancellation, then this Sol turn resumes."
         )
+    batch_instruction = (
+        " Batch 4-12 same-goal read-only items into this call."
+        if (decision.get("gate_features") or {}).get("coalesce_candidate")
+        else ""
+    )
+    image_instruction = (
+        " Include required image paths to force Terra."
+        if (decision.get("gate_features") or {}).get("semantic_multimodal")
+        else ""
+    )
     return (
         f"SR_ON DELEGATE decision_id={decision_id} lease_id={lease_id} role={role} profile={execution_profile} light={light_profile} write={write_flag}. "
-        "Call smart_router.route_task once with these exact values and a bounded task; no subagents. "
-        "Trust receipt coverage; check only parent_verification, anomalies, and a small sample. "
-        "On success append `路由：` + receipt._router_meta.route_label. On error continue in Sol and end with "
-        'exactly: "路由回退：Sol（委派未完成）".'
+        "Call smart_router.route_task once with exact values; no subagents."
+        f"{batch_instruction}{image_instruction} "
+        "Verify only receipt checks/anomalies/sample; do not reread all. "
+        "Success: append `路由：` + receipt._router_meta.route_label. "
+        'Error: finish exactly "路由回退：Sol（委派未完成）".'
     )

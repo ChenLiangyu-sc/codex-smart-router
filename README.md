@@ -13,9 +13,10 @@
    - `$router-control 开启`：启用 `STABLE`，worker/reviewer 使用 Terra。
    - `$router-control glm 开启`：启用 `GLM_FIRST`，并自动开启当前会话路由。
    - `$router-control local 开启`：启用 `LOCAL_TEXT_FIRST`，并自动开启当前会话路由；scout 优先本地文本 provider，失败自动回退 Luna。
+   - `$router-control 经济策略 v1`：临时恢复 v0.4.1 的 `work_units` 兼容门；`经济策略 v2` 切回保守静态门。
 7. 此后直接正常提需求；恢复同一会话时无需再次开启。
 
-每个新会话默认 `OFF + STABLE + LUNA_STABLE`。可随时使用 `$router-control 状态`、`$router-control 影子模式`、`glm/local 关闭` 或 `$router-control 关闭`。`glm 关闭` 和 `local 关闭` 只恢复各自的执行配置，不改变当前会话的 ON/OFF 状态。
+每个新会话默认 `OFF + STABLE + LUNA_STABLE + V2_STATIC`。可随时使用 `$router-control 状态`、`$router-control 影子模式`、`glm/local 关闭`、`经济策略 v1/v2` 或 `$router-control 关闭`。profile 和经济门切换都不改变当前会话的 ON/OFF 状态。
 
 插件升级后仍建议新开一个 Codex 会话，让新 skill、hook 定义和 MCP schema 在清晰边界上重新加载。已完成 `--apply` 的安装会让新 hook 优先使用 `runtime-current`，因此后续清理版本 cache 不会影响执行；稳定入口缺失时回退当前 `$PLUGIN_ROOT`，两者都缺失时 hook 静默放行，避免阻断发消息。升级前就已加载旧 hook 命令的活跃会话无法自动获得这项新逻辑，应新开会话；安装器不会假装能够改写已经载入内存的 hook。
 
@@ -27,6 +28,7 @@
 - **GLM-5.3 Max**：`GLM_FIRST` 下的复杂纯文本 worker/reviewer。
 - **Terra**：`STABLE` 下的 worker/reviewer；也承接图片等多模态任务和 GLM 回退。
 - **确定性等待器**：等待进程结束、文件出现/消失或日志出现固定文本时，使用一次最长 3600 秒的阻塞 MCP 调用；不调用模型，也不让主 Agent 轮询。
+- **确定性工具 fast path**：文件存在性、精确搜索、hash/元数据、`git status`、schema 校验和单次现有测试命令留在 Sol 当前回合，用最少直接工具调用完成，不启动 child。
 
 GLM 默认在周一至周五 `14:00–18:00`（`Asia/Shanghai`）切换到 Terra，周末不切换。遇到 Coding Plan 配额错误时，插件从响应中的 `next_flush_time` 建立跨项目共享熔断；短暂故障、认证错误和订阅异常也会按不同策略降级。恢复时间到达后只放行一个半开探针，成功才关闭熔断。策略可在本地 `~/.codex/smart-router/policy.json` 覆盖，格式与默认值见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -42,14 +44,16 @@ v0.4.1 不再假设 GLM 官方端点或 MAAS 中转会严格执行 OpenAI `text.
 - `ON` 中只有实际成功委派才显示 receipt 给出的真实标签，例如 `路由：Luna · …`、`路由：GLM-5.3 Max · …` 或 `路由：Terra · …`；子任务阻塞、失败或运行时不可用会显示 `路由回退：Sol（委派未完成）`。
 - `$router-control 状态` 同时显示重/轻两套配置、provider 健康状态、最近路由建议和最近一次实际委派，便于确认究竟运行了哪个模型。
 - 高风险或由 Sol 直接完成的普通任务不额外显示路由标签，减少日常噪音。
-- 短小、紧耦合、预计少于约三个 Sol 回合的任务直接由 Sol 完成；批量盘点、成组测试和范围明确的较大任务才支付委派固定成本。
+- `V2_STATIC` 不再让“仓库、目录、多个、路径、manifest、长提示词”等弱信号直接推动委派。单文件、单工具、微小修改、短验证和缺少独立边界的任务留给 Sol；只有达到角色规模门的 bounded package 才支付 child 固定成本。
+- 同一用户目标内 4–12 个同角色只读项会被提示合并进一次 child 调用；不会跨用户轮次等待凑批，也不会合并 writer。
 
-## 四层控制
+## 五层控制
 
 - **插件全局开关**：Codex `/plugins` 中启用或关闭。关闭后，本插件的 hook 和技能不运行，本地 wrapper 即使仍被 Codex 列出也会拒绝执行。
 - **会话路由开关**：`OFF / SHADOW / ON`。仅影响当前会话；恢复同一会话会保留状态。
 - **会话重任务配置**：`STABLE / GLM_FIRST`，只影响 worker/reviewer。
 - **会话轻任务配置**：`LUNA_STABLE / LOCAL_TEXT_FIRST`，只影响 scout；等待路径始终无模型；与重任务配置正交，可同时开启。
+- **会话经济门**：默认 `V2_STATIC`；`V1_COMPAT` 是升级回退开关，只恢复 v0.4.1 的 `work_units` 判断，不改变安全、权限、单委派和 provider 规则。
 
 自定义 agent 存放在 `~/.codex/agents/`，版本化运行包与稳定入口位于 `~/.codex/smart-router/runtime-releases/` 和 `runtime-current`，角色和本地 wrapper 注册在 `~/.codex/config.toml`，都是插件外的 Codex 用户配置。全局关闭插件不会删除它们，但 wrapper 会 fail closed；可运行 `python3 scripts/install_agents.py --disable` 临时停用 agent 与 wrapper，或 `--uninstall` 安全卸载仍与安装哈希一致的受管文件与配置片段。
 
@@ -58,9 +62,9 @@ v0.4.1 不再假设 GLM 官方端点或 MAAS 中转会严格执行 OpenAI `text.
 - 高风险、架构性、破坏性或无法可靠分类的任务始终留给 Sol。
 - 写入角色采用显式授权：提示词必须包含与角色相符、未被否定的正向写操作；“只读”“不要实现/修复/更新”等表达不会获得 `workspace-write`。
 - hook 是实用护栏，不是安全沙箱；Codex 自身权限、审批和 sandbox 仍是最终边界。
-- 默认只保留脱敏遥测：时间、模式、路由角色、原因代码和提示词哈希，不记录提示词正文。
+- 默认只保留脱敏遥测：时间、模式、任务桶、gate 特征、路由角色、原因代码和提示词哈希，不记录提示词正文。当前 hook API 无法可靠提供主 Sol inline token 与父级验收 token，相关字段明确标记为 unavailable，不伪造 P75/P50 成本。
 - 每个用户目标默认只有一个委派槽；已经派出 Hegel 等外部 subagent 时，同一目标不会再追加 Luna/Terra 审核。路由角色禁用原生 spawn，统一通过同步 MCP 执行并在返回时自动恢复主 Sol。hook 以文件锁原子消费槽位，并签发一次性 `lease_id`；MCP 再校验 decision、role 与 task digest 后才启动任务。每次 wrapper 写租约绑定 `tool_use_id`；运行时漏发完成事件时，下一条用户任务只会在工作区进程锁证明没有 writer 运行时清理遗留租约。
-- receipt v2 严格拒绝额外字段并限制每个 manifest 字段长度，记录覆盖范围、不一致项、结构化证据清单和最多三项父级抽查建议。主 Agent 只复核关键哈希、异常和少量样本，不重新通读已覆盖材料。执行元数据只记录模型、provider、耗时和 token usage，不保存子模型推理正文。
+- receipt v2 严格拒绝额外字段并限制每个 manifest 字段长度，记录覆盖范围、不一致项、结构化证据清单和最多三项父级抽查建议。主 Agent 只复核关键哈希、异常和少量样本，不重新通读已覆盖材料。usage adapter 优先只累计 `turn.completed` 的 per-turn usage；旧事件流只取最后一个 snapshot，避免重复累加，并分别保留 cached/cache-write/reasoning 字段及 attempt 级 fallback 台账。
 - hook 对单次附加上下文设置 512 token 上限；默认 `OFF` 的正常新会话不注入上下文。逐轮路由提示采用紧凑契约，receipt 也限制字段、条目数和单项长度，避免长会话中路由元数据无界增长。
 - 主执行路径是本地 `smart_router.route_task`：它调用隔离的 `codex exec`，固定角色模型/provider，并始终在主进程校验最终 receipt v2。OpenAI 模型使用 strict schema；GLM 使用 `json_object_adapter`，不把上游“接受了 schema 参数”等同于“真正执行了 schema”。本地配置不能注入任意 TOML；HTTP 默认只接受 localhost 或私有/回环 IP，其他 HTTP hostname 需要显式允许。GLM 运行失败后，只有只读任务或可以确认没有发生写入的 worker 才自动重试 Terra；出现工具活动或工作区变化时禁止第二个 writer，交回 Sol 处理。`run_agent.py` 也可单独用于诊断。
 

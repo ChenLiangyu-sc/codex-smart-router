@@ -29,6 +29,7 @@ from local_provider import (  # noqa: E402
 )
 
 from router_core import (  # noqa: E402
+    DEFAULT_ECONOMICS_POLICY,
     ROLES,
     ROLE_LABELS,
     WRITER_ROLES,
@@ -44,6 +45,7 @@ from router_core import (  # noqa: E402
     save_state,
     session_state_lock,
     set_execution_profile,
+    set_economics_policy,
     set_light_profile,
     set_mode,
     validate_receipt,
@@ -99,9 +101,12 @@ def status_text(state: dict[str, Any]) -> str:
     last = state.get("last_decision")
     profile = str(state.get("execution_profile") or PROFILE_STABLE)
     light_profile = str(state.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE)
+    economics_policy = str(state.get("economics_policy") or DEFAULT_ECONOMICS_POLICY)
     if isinstance(last, dict):
         last_role = str(last.get("role") or "")
-        if profile == PROFILE_GLM_FIRST and last_role in {"router_worker", "router_reviewer"}:
+        if last.get("decision") == "TOOL_ONLY":
+            last_text = "确定性工具 fast path"
+        elif profile == PROFILE_GLM_FIRST and last_role in {"router_worker", "router_reviewer"}:
             last_text = "GLM-5.3 Max / Terra 动态执行"
         elif light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and last_role == "router_scout":
             config, _ = load_local_config()
@@ -160,6 +165,7 @@ def status_text(state: dict[str, Any]) -> str:
         local_status = "本地文本模型未启用"
     return (
         f"智能路由：{mode_labels[state['mode']]}（仅当前会话）｜重任务：{profile_text}｜轻任务：{light_profile_text}｜"
+        f"经济门：{economics_policy}｜"
         f"{glm_status}｜{local_status}｜环境：{environment}｜"
         f"最近建议：{last_text}｜{actual}｜累计实际执行：成功 {completed}，失败 {failed}｜写入槽：{writer}。"
     )
@@ -223,7 +229,7 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
                     "session": state["session_key"][:12],
                 },
             )
-    if action in {"ON", "SHADOW", "OFF", "GLM_ON", "GLM_OFF", "LOCAL_ON", "LOCAL_OFF"}:
+    if action in {"ON", "SHADOW", "OFF", "GLM_ON", "GLM_OFF", "LOCAL_ON", "LOCAL_OFF", "ECON_V1", "ECON_V2"}:
         if action in {"ON", "GLM_ON", "LOCAL_ON"}:
             _, installed, wrapper_ready, parked = environment_details()
             command = PLUGIN_ROOT / "scripts" / "install_agents.py"
@@ -243,6 +249,10 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
             state = set_light_profile(root, sid, LIGHT_PROFILE_LOCAL_TEXT_FIRST, activate=True)
         elif action == "LOCAL_OFF":
             state = set_light_profile(root, sid, LIGHT_PROFILE_LUNA_STABLE)
+        elif action == "ECON_V1":
+            state = set_economics_policy(root, sid, "V1_COMPAT")
+        elif action == "ECON_V2":
+            state = set_economics_policy(root, sid, "V2_STATIC")
         else:
             state = set_mode(root, sid, action)
         append_telemetry(
@@ -252,6 +262,7 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
                 "mode": state["mode"],
                 "execution_profile": state["execution_profile"],
                 "light_profile": state["light_profile"],
+                "economics_policy": state["economics_policy"],
                 "session": state["session_key"][:12],
             },
         )
@@ -263,6 +274,8 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
             "GLM_OFF": "已关闭当前会话的 GLM_FIRST，恢复 STABLE 执行配置；智能路由的 ON/OFF 状态不变。",
             "LOCAL_ON": "已开启 LOCAL_TEXT_FIRST（仅当前会话）。批量只读侦察优先使用已配置的本地文本模型，失败或不可用时自动回退 Luna；测试和文档仍由 Luna 处理，等待任务始终使用无模型的确定性长等待。",
             "LOCAL_OFF": "已关闭当前会话的 LOCAL_TEXT_FIRST，恢复 LUNA_STABLE；智能路由的 ON/OFF 状态不变。",
+            "ECON_V1": "已切换为 V1_COMPAT 兼容经济门；恢复 v0.4.1 的 work_units 路由行为，ON/OFF 状态不变。",
+            "ECON_V2": "已切换为 V2_STATIC 保守经济门；微任务和确定性查询不启动子模型，只有足够大的独立工作包才委派，ON/OFF 状态不变。",
         }
         hook_context("UserPromptSubmit", f'SMART_ROUTER_UI_REPLY: 请原样回复："{replies[action]}"')
         return
@@ -270,7 +283,7 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
         if action == "HELP":
             reply = (
                 "当前会话可用命令：$router-control 开启、glm 开启、glm 关闭、local 开启、local 关闭、影子模式、关闭、状态。"
-                "开启后自动判断；影子模式只预览；全局关闭请使用 /plugins。"
+                "经济策略 v2 使用保守门，经济策略 v1 恢复兼容门；开启后自动判断；影子模式只预览；全局关闭请使用 /plugins。"
             )
         else:
             reply = status_text(state)
@@ -278,7 +291,13 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
         return
     if state["mode"] == "OFF":
         return
-    decision = classify(prompt, economics=True)
+    decision = classify(
+        prompt,
+        economics=True,
+        economics_policy=state["economics_policy"],
+        execution_profile=state["execution_profile"],
+        light_profile=state["light_profile"],
+    )
     decision_id = prompt_digest(prompt)
     lease_id = secrets.token_hex(16)
     decision["decision_id"] = decision_id
@@ -297,15 +316,28 @@ def on_user_prompt(payload: dict[str, Any]) -> None:
         root,
         {
             "event": "route_decision",
+            "telemetry_schema_version": 2,
+            "policy_version": "v0.4.2-alpha",
             "mode": state["mode"],
             "decision": decision["decision"],
             "role": decision.get("role"),
             "execution_profile": state["execution_profile"],
             "light_profile": state["light_profile"],
+            "economics_policy": state["economics_policy"],
             "risk": decision["risk"],
             "reason_codes": decision["reason_codes"],
             "estimated_work_units": decision.get("estimated_work_units"),
             "estimated_parent_review_ratio": decision.get("estimated_parent_review_ratio"),
+            "task_bucket": decision.get("task_bucket"),
+            "gate_features": decision.get("gate_features", {}),
+            "cost_estimate_status": decision.get("cost_estimate_status"),
+            "parent_verification_observability": "unavailable_in_current_hook_api",
+            "cost_dimensions": {
+                "quality": "hard_rules_only",
+                "sol_quota": "unavailable",
+                "total_tokens": "child_only_after_execution",
+                "latency": "child_only_after_execution",
+            },
             "prompt_sha256": decision_id,
             "session": state["session_key"][:12],
         },
@@ -444,6 +476,11 @@ def on_pre_tool(payload: dict[str, Any]) -> None:
         if state["mode"] != "ON":
             return
         decision = state.get("last_decision") or {}
+        if decision.get("decision") == "TOOL_ONLY":
+            deny_pretool(
+                "This objective is a deterministic TOOL_ONLY fast path; use the minimum direct tool call, not a child agent."
+            )
+            return
         if decision.get("decision") != "DELEGATE":
             return
         delegation = state.get("current_delegation") or {}
@@ -527,6 +564,9 @@ def on_pre_tool(payload: dict[str, Any]) -> None:
         deny_pretool("LOCAL_TEXT_FIRST scout tasks must use smart_router.route_task for dynamic fallback.")
         return
     images = tool_input.get("images") or []
+    if is_wrapper and (decision.get("gate_features") or {}).get("semantic_multimodal") and not images:
+        deny_pretool("Semantic multimodal routing requires the task's attached image paths so provider selection can force Terra.")
+        return
     if is_wrapper and images and role in {"router_scout", "router_monitor", "router_tester", "router_docs"}:
         deny_pretool("Image inputs require a Terra-capable worker or reviewer role, not a Luna role.")
         return
@@ -641,6 +681,10 @@ def on_post_tool(payload: dict[str, Any]) -> None:
             "writer_released": released,
             "decision_id": str(tool_input.get("decision_id") or "")[:12],
             "usage": receipt_meta.get("usage"),
+            "usage_stream_kind": receipt_meta.get("usage_stream_kind"),
+            "usage_counter_semantics": receipt_meta.get("usage_counter_semantics"),
+            "usage_adapter_version": receipt_meta.get("usage_adapter_version"),
+            "attempt_usage": receipt_meta.get("attempt_usage"),
             "duration_ms": receipt_meta.get("duration_ms"),
             "session": state["session_key"][:12],
         },

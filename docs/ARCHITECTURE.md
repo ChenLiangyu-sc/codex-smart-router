@@ -1,10 +1,16 @@
 # 架构与故障恢复
 
-`UserPromptSubmit` hook 读取当前 `session_id` 的状态，识别控制命令，并对普通任务做保守分类。每个新会话从 `OFF + STABLE + LUNA_STABLE` 开始；`glm 开启` 原子切换重任务配置，`local 开启` 原子切换轻任务配置，两者都会把会话设为 `ON`，恢复同一会话时沿用。`ON` 时，hook 把建议角色、两套执行配置、风险和约束作为 developer context 注入主 Sol 会话；Sol 调用本地 `smart_router.route_task` typed tool，wrapper 再以固定模型/provider 启动临时 Codex child。
+`UserPromptSubmit` hook 读取当前 `session_id` 的状态，识别控制命令，并对普通任务做保守分类。每个新会话从 `OFF + STABLE + LUNA_STABLE + V2_STATIC` 开始；`glm 开启` 原子切换重任务配置，`local 开启` 原子切换轻任务配置，两者都会把会话设为 `ON`，恢复同一会话时沿用。`经济策略 v1/v2` 只切换经济门，不改变 ON/OFF。`ON` 时，hook 把建议角色、两套执行配置、风险和约束作为 developer context 注入主 Sol 会话；Sol 调用本地 `smart_router.route_task` typed tool，wrapper 再以固定模型/provider 启动临时 Codex child。
 
 执行层与角色层分开且采用正交 profile，避免组合枚举膨胀：worker/reviewer 在 `STABLE` 映射 Terra，在 `GLM_FIRST` 动态选择 GLM-5.3 Max 或 Terra；scout 在 `LUNA_STABLE` 映射 Luna，在 `LOCAL_TEXT_FIRST` 动态选择经验证的纯文本 provider 或 Luna。tester/docs 仍固定 Luna。monitor 不再映射任何模型，而由 `wait_for_condition` 在 MCP 进程内做单次阻塞长等待。图片输入只允许 worker/reviewer，并强制 Terra。
 
-v0.4 把“是否值得委派”与能力分类分开：高风险门先保留 Sol，角色分类再判断能力，最后由经济性门估算工作单元。短小、紧耦合且预计复核比例过高的任务直接 `INLINE_SOL`；批量日志/仓库扫描、多个路径、明确数量和跨文件/合同复核等复杂信号才进入委派。每个普通用户 prompt 生成 SHA-256 `decision_id`、随机 `lease_id` 和一个委派槽；hook 以 session 文件锁执行原子 compare-and-swap。MCP 随后再次原子消费 lease，并校验 role 与规范化 task digest；hook 缺失、并发重复、task 被替换或 lease 重放都会在模型启动前拒绝。
+v0.4.2-alpha 把经济性判断升级为三门式静态代理：安全/能力门先保留高风险与不确定任务；确定性门把文件存在性、精确查询、元数据、git 状态、schema 和单次现有测试命令标记为 `TOOL_ONLY`，由当前 Sol 回合直接调用工具；规模门再要求独立 bounded package、`4+` 回合桶和角色最小项数。Luna 默认至少 4 项，Local scout 至少 8 项，GLM worker/reviewer 至少 5 项。泛化词、路径出现、prompt 长度和旧 `work_units` 只进入遥测，不再单独产生委派。`V1_COMPAT` 保留旧门作为会话级 kill switch。
+
+这不是伪装成精确成本模型：当前 Codex hook API 无法可靠观测 Always-Sol 反事实 token、会员额度或 receipt 后父级验收 token，因此 telemetry 将这些维度标记为 unavailable，`cost_estimate_status=cold_start_static_proxy`。SHADOW 记录 task bucket、deterministic kind、路径/显式数量、预计项数、bounded/micro/coalesce 标志与 reason codes，但不启动 child。积累配对 replay 数据前，不以虚构 P75/P50 放宽路由。
+
+同一 prompt 已包含 4–12 个同角色只读项时，developer context 要求把它们合并进唯一一次 child 调用。v0.4.2-alpha 不跨用户轮次排队、不等待凑批、不合并 writer，也不改变一个用户目标一个委派槽。语义多模态属于能力路由：decision 强制 worker/reviewer，PreToolUse 要求实际传入图片路径，`run_task` 再按实际 task 独立检查并在无图时 fail closed；有图才交由 provider policy 强制 Terra。图片尺寸、EXIF、页数和 hash 仍走确定性工具。
+
+每个普通用户 prompt 生成 SHA-256 `decision_id`、随机 `lease_id` 和一个委派槽；hook 以 session 文件锁执行原子 compare-and-swap。MCP 随后再次原子消费 lease，并校验 role 与规范化 task digest；hook 缺失、并发重复、task 被替换或 lease 重放都会在模型启动前拒绝。
 
 本地文本配置位于 `~/.codex/smart-router/local-provider.json`，配套模型目录位于 `local-models.json`，均为 `0600`。加载器只接受固定 schema、受限 provider/model/env 标识和 `wire_api=responses`，并拒绝用户信息、query/fragment 与默认不安全的公网 HTTP；不会把配置内容直接拼接成任意 TOML。依据 [Codex config reference](https://developers.openai.com/codex/config-reference)，当前自定义 model provider 只支持 Responses wire API，因此未来的 DeepSeek 内网网关也必须实现该协议。无鉴权内网服务可省略 `env_key`。
 
@@ -38,7 +44,7 @@ adapter 要求明确 status，且至少有一项 summary、action、finding、ev
 
 状态和遥测默认位于 Codex 分配的 `$PLUGIN_DATA`。若环境没有该变量，则退回 `~/.codex/plugin-data/codex-smart-router/`。状态文件按会话 ID 的 SHA-256 保存，避免把 ID 暴露在文件名中。
 
-状态 schema v6 记录 `current_delegation`、两套 profile、实际成功/失败计数和最近一次执行。`PostToolUse` 以最近 128 个 `tool_use_id + role` 键去重。`_router_meta` 与遥测记录实际 executor/provider、总耗时和 input/cached/output token；只保存数值与 prompt 哈希，不保存子模型推理正文。经济性判断另记录工作单元和预计父级复核比例；真实“是否发现有效问题”和人工复核耗时仍需在后续版本通过可选验收反馈补充，当前不伪造这两个指标。
+状态 schema v7 记录 `current_delegation`、两套 provider profile、经济门、实际成功/失败计数和最近一次执行。`PostToolUse` 以最近 128 个 `tool_use_id + role` 键去重。`_router_meta` 与遥测记录实际 executor/provider、总耗时、attempt 列表及 input/cached/cache-write/output/reasoning usage；只保存数值与 prompt 哈希，不保存子模型推理正文。usage adapter 只累计 `turn.completed` 的 per-turn usage；没有该事件的旧/中转流只取最后 snapshot，并用 `usage_stream_kind`、`usage_counter_semantics`、`usage_adapter_version` 明示口径。真实“是否发现有效问题”、主 Sol inline token、duplicate read ratio 和人工复核耗时仍需后续可选验收或离线 replay 补充，当前不伪造。
 
 GLM provider 健康状态位于 `~/.codex/smart-router/provider-health.json`，因此对所有项目共享。配额错误优先采用服务端 `next_flush_time`；短暂故障使用短冷却，认证失败在 Key 指纹变化前保持熔断，订阅异常使用较长冷却。到期后状态进入 half-open，并发调用中仅一个探针被放行。每次状态变化递增 generation；成功请求只有在其启动 generation 仍是当前 generation 时才能关闭熔断，避免较早的成功响应覆盖较新的 quota/auth 失败。
 

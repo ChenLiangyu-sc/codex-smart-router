@@ -10,6 +10,7 @@
 | 测试编写与验证 | `router_tester`（Luna） | 适合机械验证；必要时可写测试文件 |
 | 文档更新 | `router_docs`（Luna） | 低风险、范围清晰 |
 | 等待、轮询、状态检查 | 确定性 `wait_for_condition` | 一次长等待，不调用模型、不产生轮询 token；完成后原 Sol turn 继续 |
+| 文件存在性、精确搜索、hash/元数据、git 状态、schema、单次现有测试命令 | `TOOL_ONLY` | 当前 Sol 用最少直接工具调用完成，不支付 child startup |
 | 小任务、高风险、架构任务或不确定任务 | 主 Sol | 委派收益不足或错误代价高 |
 
 重任务 `STABLE / GLM_FIRST` 与轻任务 `LUNA_STABLE / LOCAL_TEXT_FIRST` 正交。GLM 时段和额度回退只影响 worker/reviewer：工作日 `14:00 <= time < 18:00`（`Asia/Shanghai`）在委派前直接选 Terra；额度、认证和限流错误由用户级 circuit breaker 共享给所有项目。到达服务端 `next_flush_time` 后只允许一个半开探测，成功后自动恢复 GLM。
@@ -24,4 +25,8 @@ GLM 官方端点和 MAAS 中转统一按 `json_object_adapter` 能力处理：�
 
 可写角色必须取得显式、角色级的写授权：`router_worker` 需要实现/修复/创建等动作，`router_tester` 需要新增、修复或运行测试，`router_docs` 需要更新或编写文档。否定表达和显式只读约束优先；例如“只读盘点，不要实现、不要修复、不要改代码”只能进入只读角色。“如何实现、实现方案、修复建议、propose a fix”等规划短语中的关键词不构成写授权，除非同一任务另有独立的正向写操作。分类器不确定时留给 Sol，不能用可写 sandbox 试探。
 
-每个用户目标由 `decision_id + lease_id` 绑定一个原子委派槽。任一原生外部 subagent 已消费该槽后，不再追加 Luna/Terra；插件自身的 `router_*` 原生 spawn 一律拒绝，统一使用同步 MCP，确保调用返回时主 Sol 自动继续。MCP 还会校验 task digest 并拒绝 lease 重放。小于约三个 Sol 回合的紧耦合工作由经济性门直接留给 Sol；批量日志/仓库扫描与跨文件/合同复核可进入对应 scout/reviewer。receipt v2 返回 coverage、evidence_manifest、inconsistencies 和最多三项 parent_verification；主 Agent 不重新通读全部输入。
+每个用户目标由 `decision_id + lease_id` 绑定一个原子委派槽。任一原生外部 subagent 已消费该槽后，不再追加 Luna/Terra；插件自身的 `router_*` 原生 spawn 一律拒绝，统一使用同步 MCP，确保调用返回时主 Sol 自动继续。MCP 还会校验 task digest 并拒绝 lease 重放。
+
+默认 `V2_STATIC` 只把达到规模门的独立工作包交给 child：Luna 角色至少 4 项、Local scout 至少 8 项、GLM worker/reviewer 至少 5 项；语义多模态按能力例外处理。单文件/单工具/短验证、缺少明确边界、writer 只有“全仓/批量”而没有具体数量或路径时都留 Sol。`work_units` 只保留为兼容遥测；`V1_COMPAT` 可恢复 v0.4.1 行为。静态门没有主 Sol 和父级复核 token 可观测性，不得称为已校准成本模型。
+
+同一目标内 4–12 个只读项可合并为一次 child；不跨轮次排队、不拆成多个 subagent、不合并 writer。receipt v2 返回 coverage、evidence_manifest、inconsistencies 和最多三项 parent_verification；主 Agent 不重新通读全部输入。

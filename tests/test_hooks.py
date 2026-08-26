@@ -142,13 +142,57 @@ class HookTests(unittest.TestCase):
     def test_control_persists_and_on_routes(self):
         control = self.prompt("$router-control 开启")
         self.assertIn("边界清晰且适合委派", control["hookSpecificOutput"]["additionalContext"])
-        routed = self.prompt("搜索仓库并盘点文件")
+        routed = self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         context = routed["hookSpecificOutput"]["additionalContext"]
         self.assertIn("SR_ON DELEGATE", context)
         self.assertIn("router_scout", context)
         status = self.prompt("$router-control 状态")
         self.assertIn("智能路由：已开启", status["hookSpecificOutput"]["additionalContext"])
         self.assertIn("最近建议：Luna · 只读侦察", status["hookSpecificOutput"]["additionalContext"])
+
+    def test_economics_policy_switch_is_session_scoped_and_reversible(self):
+        self.prompt("$router-control 开启")
+        conservative = self.prompt("跨文件复核两个模块")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("INLINE_SOL", conservative)
+        switched = self.prompt("$router-control 经济策略 v1")
+        self.assertIn("V1_COMPAT", switched["hookSpecificOutput"]["additionalContext"])
+        compat = self.prompt("跨文件复核两个模块")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("SR_ON DELEGATE", compat)
+        status = self.prompt("$router-control 状态")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("经济门：V1_COMPAT", status)
+        restored = self.prompt("$router-control 经济策略 v2")
+        self.assertIn("V2_STATIC", restored["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(router_core.load_state(self.data, self.session)["mode"], "ON")
+
+    def test_tool_only_fast_path_never_opens_a_delegation_slot(self):
+        self.prompt("$router-control 开启")
+        context = self.prompt("查看 git status")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("SR_ON TOOL_ONLY", context)
+        state = router_core.load_state(self.data, self.session)
+        self.assertEqual(state["last_decision"]["decision"], "TOOL_ONLY")
+        self.assertEqual(state["current_delegation"]["status"], "not_applicable")
+        denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_input": {"role": "router_scout", "task": "查看 git status"},
+            },
+        )
+        self.assertIn("does not match", denied["hookSpecificOutput"]["permissionDecisionReason"])
+        native_denied = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "spawn_agent",
+                "tool_input": {"task_name": "wasteful", "agent_type": "external_scout"},
+            },
+        )
+        self.assertIn("TOOL_ONLY", native_denied["hookSpecificOutput"]["permissionDecisionReason"])
+        records = [json.loads(line) for line in (self.data / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()]
+        decision = next(item for item in reversed(records) if item.get("event") == "route_decision")
+        self.assertEqual(decision["telemetry_schema_version"], 2)
+        self.assertEqual(decision["decision"], "TOOL_ONLY")
+        self.assertEqual(decision["gate_features"]["deterministic_tool_kind"], "git_status")
+        self.assertEqual(decision["parent_verification_observability"], "unavailable_in_current_hook_api")
 
     def test_glm_profile_activates_persists_and_is_bound_to_wrapper_calls(self):
         ready_home = self.ready_home("glm-ready-home")
@@ -165,7 +209,7 @@ class HookTests(unittest.TestCase):
 
         routed = self.call(
             "user-prompt-submit",
-            {"prompt": "请对当前仓库多个模块做一次代码审查"},
+            {"prompt": "合同一致性检查 5 个模块"},
             env,
         )
         context = routed["hookSpecificOutput"]["additionalContext"]
@@ -240,7 +284,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(state["mode"], "ON")
         self.assertEqual(state["light_profile"], "LOCAL_TEXT_FIRST")
 
-        routed = self.call("user-prompt-submit", {"prompt": "搜索仓库并盘点文件"}, env)
+        routed = self.call("user-prompt-submit", {"prompt": "搜索当前仓库并批量盘点所有日志和 manifest"}, env)
         context = routed["hookSpecificOutput"]["additionalContext"]
         self.assertIn("light=LOCAL_TEXT_FIRST", context)
         native = self.call(
@@ -255,7 +299,7 @@ class HookTests(unittest.TestCase):
                 "tool_name": "mcp__smart_router__route_task",
                 "tool_input": {
                     "role": "router_scout",
-                    "task": "搜索仓库并盘点文件",
+                    "task": "搜索当前仓库并批量盘点所有日志和 manifest",
                     "light_profile": "LUNA_STABLE",
                 },
             },
@@ -269,7 +313,7 @@ class HookTests(unittest.TestCase):
                     "tool_name": "mcp__smart_router__route_task",
                     "tool_input": {
                         "role": "router_scout",
-                        "task": "搜索仓库并盘点文件",
+                        "task": "搜索当前仓库并批量盘点所有日志和 manifest",
                         "light_profile": "LOCAL_TEXT_FIRST",
                     },
                 },
@@ -292,7 +336,7 @@ class HookTests(unittest.TestCase):
         self.call("user-prompt-submit", {"prompt": "$router-control glm 开启"}, env)
         routed = self.call(
             "user-prompt-submit",
-            {"prompt": "搜索仓库并盘点文件"},
+            {"prompt": "搜索当前仓库并批量盘点所有日志和 manifest"},
             env,
         )
         self.assertIn("role=router_scout profile=GLM_FIRST", routed["hookSpecificOutput"]["additionalContext"])
@@ -302,7 +346,7 @@ class HookTests(unittest.TestCase):
                 "tool_name": "mcp__smart_router__route_task",
                 "tool_input": {
                     "role": "router_scout",
-                    "task": "搜索仓库并盘点文件",
+                    "task": "搜索当前仓库并批量盘点所有日志和 manifest",
                     "execution_profile": "GLM_FIRST",
                     "images": ["screen.png"],
                 },
@@ -311,9 +355,35 @@ class HookTests(unittest.TestCase):
         )
         self.assertIn("Terra-capable", denied["hookSpecificOutput"]["permissionDecisionReason"])
 
+    def test_semantic_multimodal_route_requires_images_for_terra_selection(self):
+        self.prompt("$router-control 开启")
+        context = self.prompt("分析截图内容并列出视觉缺陷")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("role=router_reviewer", context)
+        self.assertIn("Include required image paths to force Terra", context)
+        missing = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_input": {"role": "router_reviewer", "task": "分析截图内容并列出视觉缺陷"},
+            },
+        )
+        self.assertIn("requires", missing["hookSpecificOutput"]["permissionDecisionReason"])
+        allowed = self.call(
+            "pre-tool-use",
+            {
+                "tool_name": "mcp__smart_router__route_task",
+                "tool_input": {
+                    "role": "router_reviewer",
+                    "task": "分析截图内容并列出视觉缺陷",
+                    "images": ["screen.png"],
+                },
+            },
+        )
+        self.assertIsNone(allowed)
+
     def test_shadow_never_delegates(self):
         self.prompt("$router-control 影子模式")
-        result = self.prompt("搜索仓库并盘点文件")
+        result = self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         context = result["hookSpecificOutput"]["additionalContext"]
         self.assertIn("SR_SHADOW", context)
         self.assertIn("路由预览：Luna · 只读侦察", context)
@@ -327,11 +397,11 @@ class HookTests(unittest.TestCase):
 
     def test_posttool_records_actual_read_only_execution_for_status(self):
         self.prompt("/router on")
-        self.prompt("搜索仓库并盘点文件")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         call = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-scout-1",
-            "tool_input": {"role": "router_scout", "task": "搜索仓库并盘点文件"},
+            "tool_input": {"role": "router_scout", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
             "tool_response": {"isError": False},
         }
         self.assertIsNone(self.call("post-tool-use", call))
@@ -351,11 +421,11 @@ class HookTests(unittest.TestCase):
 
     def test_blocked_receipt_counts_as_failed_actual_execution(self):
         self.prompt("/router on")
-        self.prompt("搜索仓库并盘点文件")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         call = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-scout-blocked",
-            "tool_input": {"role": "router_scout", "task": "搜索仓库并盘点文件"},
+            "tool_input": {"role": "router_scout", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
             "tool_response": {
                 "isError": False,
                 "structuredContent": {"status": "blocked"},
@@ -390,7 +460,7 @@ class HookTests(unittest.TestCase):
         )
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
         self.prompt("/router on")
-        self.prompt("搜索仓库并盘点文件")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         native = self.call(
             "pre-tool-use",
             {"tool_input": {"agent_type": "router_scout", "fork_turns": "none"}},
@@ -409,12 +479,12 @@ class HookTests(unittest.TestCase):
 
     def test_wrapper_tool_guard(self):
         self.prompt("/router on")
-        self.prompt("搜索仓库并盘点文件")
+        self.prompt("搜索当前仓库并批量盘点所有日志和 manifest")
         allowed = self.call(
             "pre-tool-use",
             {
                 "tool_name": "mcp__smart_router__route_task",
-                "tool_input": {"role": "router_scout", "task": "搜索仓库并盘点文件"},
+                "tool_input": {"role": "router_scout", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
             },
         )
         self.assertIsNone(allowed)
@@ -422,7 +492,7 @@ class HookTests(unittest.TestCase):
             "pre-tool-use",
             {
                 "tool_name": "mcp__smart_router__route_task",
-                "tool_input": {"role": "router_worker", "task": "搜索仓库并盘点文件"},
+                "tool_input": {"role": "router_worker", "task": "搜索当前仓库并批量盘点所有日志和 manifest"},
             },
         )
         self.assertEqual(wrong["hookSpecificOutput"]["permissionDecision"], "deny")
@@ -520,7 +590,7 @@ class HookTests(unittest.TestCase):
 
     def test_native_writer_is_refused_even_when_role_matches(self):
         self.prompt("/router on")
-        self.prompt("实现当前仓库中的三个边界清晰修复")
+        self.prompt("实现当前仓库中的4 个边界清晰修复")
         args = {
             "tool_use_id": "native-worker-1",
             "tool_input": {"agent_type": "router_worker", "fork_turns": "none"},
@@ -530,7 +600,7 @@ class HookTests(unittest.TestCase):
 
     def test_mcp_writer_lease_releases_after_success_and_failure(self):
         self.prompt("/router on")
-        self.prompt("实现当前仓库中的三个边界清晰小功能")
+        self.prompt("实现当前仓库中的4 个边界清晰小功能")
         first = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-worker-1",
@@ -546,7 +616,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("single delegation slot", busy["hookSpecificOutput"]["permissionDecisionReason"])
 
         self.assertIsNone(self.call("post-tool-use", {**first, "tool_response": {"isError": False}}))
-        self.prompt("实现当前仓库中的另外三个边界清晰小功能")
+        self.prompt("实现当前仓库中的另外 4 个边界清晰小功能")
         self.assertIsNone(self.call("pre-tool-use", second))
         self.assertIsNone(self.call("post-tool-use", {**second, "tool_response": {"isError": True}}))
 
@@ -555,14 +625,14 @@ class HookTests(unittest.TestCase):
             "tool_use_id": "mcp-worker-3",
             "tool_input": {"role": "router_worker", "task": "新建 third.txt 并写入 third"},
         }
-        self.prompt("实现当前仓库中的第三批边界清晰小功能")
+        self.prompt("实现当前仓库中的第三批 4 个边界清晰小功能")
         self.assertIsNone(self.call("pre-tool-use", third))
 
     def test_mode_change_preserves_inflight_writer_until_posttool(self):
         workspace = self.data / "mode-workspace"
         workspace.mkdir()
         self.prompt("/router on")
-        self.prompt("实现当前仓库中的三个边界清晰小功能")
+        self.prompt("实现当前仓库中的4 个边界清晰小功能")
         call = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-mode-change",
@@ -599,7 +669,7 @@ class HookTests(unittest.TestCase):
 
     def test_next_user_turn_recovers_missed_mcp_posttool_release(self):
         self.prompt("/router on")
-        self.prompt("在当前仓库批量新建 first.txt、first.log 和 first.md 并写入 first")
+        self.prompt("在当前仓库批量新建 first.txt、first.log、first.md 和 first.json 并写入 first")
         first = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-missed-posttool",
@@ -610,7 +680,7 @@ class HookTests(unittest.TestCase):
 
         # Simulate a runtime path that never delivered PostToolUse. A new user
         # task is a safe recovery boundary and must not inherit the stale lease.
-        self.prompt("在当前仓库批量新建 second.txt、second.log 和 second.md 并写入 second")
+        self.prompt("在当前仓库批量新建 second.txt、second.log、second.md 和 second.json 并写入 second")
         second = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-next-turn",
@@ -623,7 +693,7 @@ class HookTests(unittest.TestCase):
         workspace = self.data / "workspace"
         workspace.mkdir()
         self.prompt("/router on")
-        self.prompt("在当前仓库批量新建 first.txt、first.log 和 first.md 并写入 first")
+        self.prompt("在当前仓库批量新建 first.txt、first.log、first.md 和 first.json 并写入 first")
         first = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-live-writer",
@@ -638,7 +708,7 @@ class HookTests(unittest.TestCase):
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.prompt("在当前仓库批量新建 second.txt、second.log 和 second.md 并写入 second")
+            self.prompt("在当前仓库批量新建 second.txt、second.log、second.md 和 second.json 并写入 second")
             blocked = self.call(
                 "pre-tool-use",
                 {
@@ -655,7 +725,7 @@ class HookTests(unittest.TestCase):
 
     def test_mcp_posttool_cannot_release_a_different_call_lease(self):
         self.prompt("/router on")
-        self.prompt("实现当前仓库中的三个边界清晰小功能")
+        self.prompt("实现当前仓库中的4 个边界清晰小功能")
         active = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-active",
@@ -672,7 +742,7 @@ class HookTests(unittest.TestCase):
 
     def test_mcp_posttool_cannot_release_a_different_role_lease(self):
         self.prompt("/router on")
-        self.prompt("实现当前仓库中的三个边界清晰小功能")
+        self.prompt("实现当前仓库中的4 个边界清晰小功能")
         active = {
             "tool_name": "mcp__smart_router__route_task",
             "tool_use_id": "mcp-role-bound",
