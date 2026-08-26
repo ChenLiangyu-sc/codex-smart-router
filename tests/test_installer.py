@@ -337,7 +337,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(fields["model"], expected_models[fields["name"]])
                 self.assertIn(fields["sandbox_mode"], {"read-only", "workspace-write"})
                 self.assertIn('developer_instructions = """', raw)
-                self.assertIn("Return exactly one JSON object", raw)
+                self.assertIn("receipt-v2 JSON object", raw)
 
 
 if __name__ == "__main__":

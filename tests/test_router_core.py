@@ -141,6 +141,13 @@ class RouterCoreTests(unittest.TestCase):
         self.assertTrue(result["write_authorized"])
         self.assertTrue(router_core.write_authorized_for(task, "router_worker"))
 
+    def test_mixed_language_test_command_is_explicit_authorization(self):
+        task = "在 backend 目录运行现有 npm test，并汇总结果"
+        result = router_core.classify(task)
+        self.assertEqual(result["role"], "router_tester")
+        self.assertTrue(result["write_authorized"])
+        self.assertTrue(router_core.write_authorized_for(task, "router_tester"))
+
     def test_post_write_read_only_verification_does_not_cancel_authorization(self):
         task = (
             "仅新建 first.txt 并写入 FIRST。不要修改、创建或删除任何其他文件；"
@@ -190,7 +197,8 @@ class RouterCoreTests(unittest.TestCase):
             router_core._atomic_json(router_core.state_path(root, "s1"), state)
             loaded = router_core.load_state(root, "s1")
             self.assertEqual(loaded["mode"], "ON")
-            self.assertEqual(loaded["schema_version"], 5)
+            self.assertEqual(loaded["schema_version"], 6)
+            self.assertIsNone(loaded["current_delegation"])
             self.assertEqual(loaded["execution_profile"], "STABLE")
             self.assertEqual(loaded["light_profile"], "LUNA_STABLE")
             self.assertEqual(loaded["execution_counts"], {"completed": 0, "failed": 0})
@@ -217,10 +225,16 @@ class RouterCoreTests(unittest.TestCase):
 
     def test_receipt_validation(self):
         good = {
+            "schema_version": 2,
+            "objective_id": "0" * 64,
             "status": "completed",
             "summary": "done",
             "findings": [],
             "evidence": ["tests passed"],
+            "evidence_manifest": [],
+            "inconsistencies": [],
+            "coverage": {"mode": "full", "checked": 1, "total": 1},
+            "parent_verification": ["spot-check the test summary"],
             "changed_files": [],
             "validation": ["unit tests"],
             "remaining_risks": [],
@@ -254,10 +268,84 @@ class RouterCoreTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("findings contains a field-name fragment", errors)
 
+        extra = {**good, "unbounded": "x" * 10000}
+        valid, errors, _ = router_core.validate_receipt(json.dumps(extra))
+        self.assertFalse(valid)
+        self.assertIn("unexpected fields: unbounded", errors)
+
+        long_manifest = {
+            **good,
+            "evidence_manifest": [
+                {"claim": "x" * 501, "path": "a.py", "locator": "line 1", "sha256": None}
+            ],
+        }
+        valid, errors, _ = router_core.validate_receipt(json.dumps(long_manifest))
+        self.assertFalse(valid)
+        self.assertIn("evidence_manifest[0].claim exceeds 500 characters", errors)
+
+    def test_common_batch_and_complex_review_phrases_route(self):
+        cases = {
+            "分析所有日志": "router_scout",
+            "检查 10 个日志文件": "router_scout",
+            "扫描整个仓库": "router_scout",
+            "跨文件复核两个模块": "router_reviewer",
+            "合同一致性检查 8 个模块": "router_reviewer",
+        }
+        for prompt, role in cases.items():
+            with self.subTest(prompt=prompt):
+                result = router_core.classify(prompt, economics=True)
+                self.assertEqual(result["decision"], "DELEGATE", result)
+                self.assertEqual(result["role"], role)
+
+        for prompt in ("读日志", "检查单个日志文件"):
+            with self.subTest(prompt=prompt):
+                result = router_core.classify(prompt, economics=True)
+                self.assertEqual(result["decision"], "INLINE_SOL", result)
+                self.assertIn("routing_overhead", result["reason_codes"])
+
+    def test_runtime_lease_is_task_bound_and_one_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sid = "lease-session"
+            router_core.set_mode(root, sid, "ON")
+            state = router_core.load_state(root, sid)
+            args = {"task": "搜索仓库所有文件"}
+            digest = router_core.delegation_task_digest("route_task", args)
+            state["last_decision"] = {
+                "decision": "DELEGATE",
+                "decision_id": "1" * 64,
+                "lease_id": "2" * 32,
+                "role": "router_scout",
+            }
+            state["current_delegation"] = {
+                "decision_id": "1" * 64,
+                "lease_id": "2" * 32,
+                "role": "router_scout",
+                "task_digest": digest,
+                "status": "started",
+            }
+            router_core.save_state(root, sid, state)
+            self.assertFalse(
+                router_core.consume_runtime_lease(
+                    root, "1" * 64, "2" * 32, "router_scout", "0" * 64
+                )
+            )
+            self.assertTrue(
+                router_core.consume_runtime_lease(
+                    root, "1" * 64, "2" * 32, "router_scout", digest
+                )
+            )
+            self.assertFalse(
+                router_core.consume_runtime_lease(
+                    root, "1" * 64, "2" * 32, "router_scout", digest
+                )
+            )
+
     def test_routing_context_is_compact_and_user_visible(self):
         scout = router_core.classify("搜索仓库并盘点相关文件")
+        scout["decision_id"] = "0" * 64
         delegated = router_core.routing_context("ON", scout)
-        self.assertLessEqual(len(delegated), 400)
+        self.assertLessEqual(len(delegated), 512)
         self.assertIn("receipt._router_meta.route_label", delegated)
         self.assertIn("路由回退：Sol（委派未完成）", delegated)
 
@@ -271,8 +359,18 @@ class RouterCoreTests(unittest.TestCase):
         self.assertIn("路由预览：Luna · 只读侦察", shadow)
 
         worker = router_core.classify("实现这个边界清晰的小功能")
+        worker["decision_id"] = "0" * 64
         glm_shadow = router_core.routing_context("SHADOW", worker, "GLM_FIRST")
         self.assertIn("GLM-5.3 Max / Terra", glm_shadow)
+
+    def test_routing_economics_keeps_tightly_coupled_work_inline(self):
+        small = router_core.classify("请独立做一次代码审查", economics=True)
+        self.assertEqual(small["decision"], "INLINE_SOL")
+        self.assertIn("routing_overhead", small["reason_codes"])
+
+        batch = router_core.classify("搜索当前仓库并批量盘点所有日志和 manifest", economics=True)
+        self.assertEqual(batch["decision"], "DELEGATE")
+        self.assertLessEqual(batch["estimated_parent_review_ratio"], 0.3)
 
     def test_execution_profile_persists_and_glm_on_activates_routing(self):
         with tempfile.TemporaryDirectory() as tmp:

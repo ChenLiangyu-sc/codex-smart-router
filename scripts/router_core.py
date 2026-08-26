@@ -33,12 +33,13 @@ ROLES = {
     "router_tester",
     "router_docs",
 }
+MODEL_ROLES = ROLES - {"router_monitor"}
 WRITER_ROLES = {"router_worker", "router_tester", "router_docs"}
 ROLE_LABELS = {
     "router_scout": "Luna · 只读侦察",
     "router_worker": "Terra · 执行",
     "router_reviewer": "Terra · 审查",
-    "router_monitor": "Luna · 监控",
+    "router_monitor": "确定性长等待（无模型）",
     "router_tester": "Luna · 测试",
     "router_docs": "Luna · 文档",
 }
@@ -139,16 +140,20 @@ HIGH_RISK = {
     "data": ("数据库迁移", "schema migration", "删库", "清空数据", "drop table", "truncate", "数据迁移"),
     "destructive": ("rm -rf", "永久删除", "不可逆", "销毁", "wipe", "destroy", "force push"),
     "money": ("支付", "扣款", "账单", "payment", "billing", "转账"),
-    "architecture": ("系统架构", "跨系统", "架构决策", "architecture", "distributed transaction", "一致性"),
-    "concurrency": ("并发", "竞态", "死锁", "race condition", "deadlock", "事务隔离"),
+    "architecture": ("系统架构", "跨系统", "架构决策", "architecture", "distributed transaction"),
+    "concurrency": ("并发", "竞态", "死锁", "race condition", "deadlock", "事务隔离", "并发一致性", "事务一致性"),
 }
 
 CATEGORY_TERMS = {
     "router_monitor": ("等待", "轮询", "监控", "状态检查", "watch", "poll", "monitor", "babysit"),
-    "router_reviewer": ("代码审查", "复核", "review", "找风险", "审阅", "audit"),
+    "router_reviewer": ("代码审查", "跨文件复核", "合同一致性", "一致性检查", "缺陷归因", "review", "找风险", "审阅", "audit"),
     "router_tester": ("测试", "用例", "test", "pytest", "unittest", "验证失败", "跑一下测试"),
     "router_docs": ("文档", "readme", "说明书", "注释更新", "documentation", "changelog"),
-    "router_scout": ("搜索", "查找", "盘点", "调研代码", "读日志", "日志分析", "定位文件", "收集证据", "scan", "search", "inventory", "inspect logs"),
+    "router_scout": (
+        "搜索", "查找", "盘点", "批量核查", "轨迹审阅", "manifest", "sha", "调研代码", "读日志",
+        "日志分析", "分析所有日志", "检查日志", "日志文件", "日志归类", "身份盘点", "定位文件", "收集证据",
+        "扫描", "scan", "search", "inventory", "inspect logs", "analyze logs", "scan repository",
+    ),
     "router_worker": (
         "实现",
         "修复",
@@ -168,6 +173,14 @@ CATEGORY_TERMS = {
     ),
 }
 
+BATCH_TERMS = (
+    "批量", "全部", "所有", "多个", "整仓", "全仓", "仓库", "目录", "测试套件", "轨迹", "manifest",
+    "案例", "样本", "batch", "all files", "repository", "workspace", "test suite", "multiple",
+)
+PATH_SIGNAL = re.compile(r"(?:^|\s)(?:\.?\.?/|/)[^\s，。；;]+|\b[\w.-]+/(?:[\w./-]+)")
+COUNT_SIGNAL = re.compile(r"(?<!\d)(?:[3-9]|[1-9]\d+)\s*(?:个|项|份|组|files?|modules?|cases?)", re.I)
+COMPLEX_REVIEW_TERMS = ("跨文件", "跨模块", "合同一致性", "缺陷归因", "cross-file", "cross module", "contract")
+
 WRITE_INTENT_PATTERNS = {
     "router_worker": (
         re.compile(r"实现|修复|改代码|重构|新增功能|\b(?:implement|fix|refactor|patch)\b", re.I),
@@ -176,7 +189,10 @@ WRITE_INTENT_PATTERNS = {
     ),
     "router_tester": (
         re.compile(r"(?:补充|新增|添加|编写|写|完善|修复).{0,10}(?:测试|用例)", re.I),
-        re.compile(r"(?:运行|执行|跑).{0,6}(?:测试|pytest|unittest)", re.I),
+        re.compile(
+            r"(?:运行|执行|跑).{0,20}(?:测试|用例|pytest|unittest|\b(?:npm|pnpm|yarn)\s+test\b)",
+            re.I,
+        ),
         re.compile(r"\b(?:add|write|update|fix|run)\b.{0,16}\b(?:tests?|pytest|unittest)\b", re.I),
     ),
     "router_docs": (
@@ -251,10 +267,86 @@ def state_path(root: Path, session_id: str) -> Path:
     return root / "sessions" / f"{session_key(session_id)}.json"
 
 
+@contextmanager
+def state_key_lock(root: Path, key: str) -> Iterator[None]:
+    """Serialize state transitions for one hashed session key across hook processes."""
+    lock_dir = root / "state-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = lock_dir / f"{key}.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def session_state_lock(root: Path, session_id: str) -> Iterator[None]:
+    with state_key_lock(root, session_key(session_id)):
+        yield
+
+
+def delegation_task_digest(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Bind a runtime lease to exactly the task or wait condition approved by the hook."""
+    if "wait_for_condition" in tool_name:
+        payload = {
+            name: tool_input.get(name)
+            for name in ("condition", "target", "expected", "timeout_seconds", "interval_seconds")
+            if name in tool_input
+        }
+    else:
+        payload = {"task": str(tool_input.get("task") or "")}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
+
+
+def consume_runtime_lease(
+    root: Path,
+    decision_id: str,
+    lease_id: str,
+    role: str,
+    task_digest: str,
+) -> bool:
+    """Atomically consume the hook-created lease before MCP starts any work."""
+    sessions = root / "sessions"
+    if not sessions.is_dir():
+        return False
+    for path in sessions.glob("*.json"):
+        key = path.stem
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            continue
+        with state_key_lock(root, key):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            delegation = state.get("current_delegation")
+            if not isinstance(delegation, dict):
+                continue
+            if not (
+                state.get("mode") == "ON"
+                and delegation.get("decision_id") == decision_id
+                and delegation.get("lease_id") == lease_id
+                and delegation.get("role") == role
+                and delegation.get("task_digest") == task_digest
+                and delegation.get("status") == "started"
+            ):
+                continue
+            delegation["status"] = "running"
+            delegation["runtime_started_at"] = int(time.time())
+            state["current_delegation"] = delegation
+            state["updated_at"] = int(time.time())
+            _atomic_json(path, state)
+            return True
+    return False
+
+
 def default_state(session_id: str) -> dict[str, Any]:
     now = int(time.time())
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "session_key": session_key(session_id),
         "mode": "OFF",
         "execution_profile": PROFILE_STABLE,
@@ -267,6 +359,7 @@ def default_state(session_id: str) -> dict[str, Any]:
         "execution_counts": {"completed": 0, "failed": 0},
         "last_execution": None,
         "recent_execution_keys": [],
+        "current_delegation": None,
     }
 
 
@@ -298,7 +391,7 @@ def load_state(root: Path, session_id: str) -> dict[str, Any]:
         return default_state(session_id)
     # Additive migration keeps an existing session's mode while enabling newer
     # user-facing execution history.
-    state["schema_version"] = 5
+    state["schema_version"] = 6
     profile = str(state.get("execution_profile") or PROFILE_STABLE).upper()
     state["execution_profile"] = profile if profile in EXECUTION_PROFILES else PROFILE_STABLE
     light_profile = str(state.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
@@ -328,6 +421,10 @@ def load_state(root: Path, session_id: str) -> dict[str, Any]:
         if isinstance(role, str) and isinstance(tool_use_id, str) and role and tool_use_id:
             recent = [f"{role}:{tool_use_id}"]
     state["recent_execution_keys"] = recent[-128:]
+    delegation = state.get("current_delegation")
+    if not isinstance(delegation, dict):
+        delegation = None
+    state["current_delegation"] = delegation
     return state
 
 
@@ -466,7 +563,7 @@ def write_authorized_for(prompt: str, role: str) -> bool:
     )
 
 
-def classify(prompt: str) -> dict[str, Any]:
+def classify(prompt: str, *, economics: bool = False) -> dict[str, Any]:
     text = " ".join(prompt.lower().split())
     risk_reasons = _risk_reasons(text)
     if risk_reasons:
@@ -527,6 +624,33 @@ def classify(prompt: str) -> dict[str, Any]:
             reasons.append(f"least_privilege_remap:{unauthorized_writers[0][0]}")
         if write_authorized:
             reasons.append("explicit_write_intent")
+        batch_hits = _matches(text, BATCH_TERMS)
+        path_hits = PATH_SIGNAL.findall(text)
+        count_hits = COUNT_SIGNAL.findall(text)
+        complex_review_hits = _matches(text, COMPLEX_REVIEW_TERMS) if role == "router_reviewer" else []
+        work_units = min(
+            12,
+            1
+            + len(found)
+            + min(4, len(batch_hits) * 2)
+            + min(3, len(path_hits))
+            + min(3, len(count_hits) * 2)
+            + min(2, len(complex_review_hits) * 2)
+            + (1 if len(text) >= 160 else 0),
+        )
+        if economics and role != "router_monitor" and work_units < 4:
+            return {
+                "decision": "INLINE_SOL",
+                "role": None,
+                "risk": "LOW",
+                "confidence": 0.9,
+                "reason_codes": ["routing_overhead", f"candidate:{role}", f"work_units:{work_units}"],
+                "write_authorized": False,
+                "estimated_work_units": work_units,
+                "estimated_parent_review_ratio": 1.0,
+            }
+        expected_review_ratio = round(min(0.3, 1.0 / max(4, work_units)), 2)
+        reasons.extend([f"work_units:{work_units}", f"review_ratio:{expected_review_ratio:.2f}"])
         return {
             "decision": "DELEGATE",
             "role": role,
@@ -534,6 +658,8 @@ def classify(prompt: str) -> dict[str, Any]:
             "confidence": min(0.96, 0.78 + 0.06 * count),
             "reason_codes": reasons,
             "write_authorized": write_authorized,
+            "estimated_work_units": work_units,
+            "estimated_parent_review_ratio": expected_review_ratio,
         }
 
     if len(text) < 80:
@@ -584,10 +710,16 @@ def cleanup_expired(root: Path, now: int | None = None) -> int:
 
 
 RECEIPT_FIELDS = {
+    "schema_version": int,
+    "objective_id": str,
     "status": str,
     "summary": str,
     "findings": list,
     "evidence": list,
+    "evidence_manifest": list,
+    "inconsistencies": list,
+    "coverage": dict,
+    "parent_verification": list,
     "changed_files": list,
     "validation": list,
     "remaining_risks": list,
@@ -596,12 +728,15 @@ RECEIPT_FIELDS = {
 }
 
 RECEIPT_STRING_LIMITS = {
+    "objective_id": 64,
     "summary": 500,
     "recommended_next_action": 300,
 }
 RECEIPT_ARRAY_LIMITS = {
     "findings": (6, 800),
     "evidence": (6, 800),
+    "inconsistencies": (4, 600),
+    "parent_verification": (3, 300),
     "changed_files": (50, 300),
     "validation": (6, 600),
     "remaining_risks": (6, 600),
@@ -610,6 +745,10 @@ RECEIPT_RESERVED_FRAGMENTS = {
     "summary",
     "findings",
     "evidence",
+    "evidence_manifest",
+    "inconsistencies",
+    "coverage",
+    "parent_verification",
     "changed_files",
     "validation",
     "remaining_risks",
@@ -625,6 +764,9 @@ def validate_receipt(raw: str) -> tuple[bool, list[str], dict[str, Any] | None]:
         return False, ["response must be one JSON object without Markdown fences"], None
     if not isinstance(receipt, dict):
         return False, ["receipt root must be an object"], None
+    extra_fields = set(receipt) - set(RECEIPT_FIELDS)
+    if extra_fields:
+        errors.append("unexpected fields: " + ", ".join(sorted(extra_fields)))
     for field, expected in RECEIPT_FIELDS.items():
         if field not in receipt:
             errors.append(f"missing field: {field}")
@@ -632,6 +774,11 @@ def validate_receipt(raw: str) -> tuple[bool, list[str], dict[str, Any] | None]:
             errors.append(f"{field} must be {expected.__name__}")
     if isinstance(receipt.get("status"), str) and receipt["status"] not in {"completed", "blocked", "failed"}:
         errors.append("status must be completed, blocked, or failed")
+    if receipt.get("schema_version") != 2:
+        errors.append("schema_version must be 2")
+    objective_id = receipt.get("objective_id")
+    if isinstance(objective_id, str) and not re.fullmatch(r"[0-9a-f]{64}", objective_id):
+        errors.append("objective_id must be a lowercase SHA-256 hex digest")
     for field, limit in RECEIPT_STRING_LIMITS.items():
         value = receipt.get(field)
         if isinstance(value, str) and len(value) > limit:
@@ -657,6 +804,40 @@ def validate_receipt(raw: str) -> tuple[bool, list[str], dict[str, Any] | None]:
         }
         if fragments & RECEIPT_RESERVED_FRAGMENTS:
             errors.append(f"{field} contains a field-name fragment")
+    manifest = receipt.get("evidence_manifest")
+    if isinstance(manifest, list):
+        if len(manifest) > 6:
+            errors.append("evidence_manifest exceeds 6 items")
+        for index, item in enumerate(manifest):
+            if not isinstance(item, dict):
+                errors.append(f"evidence_manifest[{index}] must be an object")
+                continue
+            if set(item) != {"claim", "path", "locator", "sha256"}:
+                errors.append(f"evidence_manifest[{index}] has invalid fields")
+                continue
+            if not all(isinstance(item[name], str) for name in ("claim", "path", "locator")):
+                errors.append(f"evidence_manifest[{index}] text fields must be strings")
+            else:
+                for name, limit in (("claim", 500), ("path", 300), ("locator", 120)):
+                    if len(item[name]) > limit:
+                        errors.append(f"evidence_manifest[{index}].{name} exceeds {limit} characters")
+            digest = item.get("sha256")
+            if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                errors.append(f"evidence_manifest[{index}].sha256 must be null or lowercase SHA-256")
+    coverage = receipt.get("coverage")
+    if isinstance(coverage, dict):
+        if set(coverage) != {"mode", "checked", "total"}:
+            errors.append("coverage has invalid fields")
+        if coverage.get("mode") not in {"full", "sample", "targeted"}:
+            errors.append("coverage.mode must be full, sample, or targeted")
+        checked = coverage.get("checked")
+        total = coverage.get("total")
+        if not isinstance(checked, int) or isinstance(checked, bool) or checked < 0:
+            errors.append("coverage.checked must be a non-negative integer")
+        if total is not None and (not isinstance(total, int) or isinstance(total, bool) or total < 0):
+            errors.append("coverage.total must be null or a non-negative integer")
+        if isinstance(checked, int) and isinstance(total, int) and checked > total:
+            errors.append("coverage.checked cannot exceed coverage.total")
     return not errors, errors, receipt
 
 
@@ -672,7 +853,7 @@ def routing_context(
             recommendation = "Sol"
         elif execution_profile == PROFILE_GLM_FIRST and role in {"router_worker", "router_reviewer"}:
             recommendation = "GLM-5.3 Max / Terra 动态执行"
-        elif light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and role in {"router_scout", "router_monitor"}:
+        elif light_profile == LIGHT_PROFILE_LOCAL_TEXT_FIRST and role == "router_scout":
             recommendation = "Local Text / Luna 动态执行"
         else:
             recommendation = ROLE_LABELS.get(role, "Sol")
@@ -683,11 +864,18 @@ def routing_context(
     if decision["decision"] != "DELEGATE":
         return f"SR_ON INLINE_SOL risk={decision['risk']}. Do not delegate; handle normally in Sol without a route label."
     write_flag = "1" if decision.get("write_authorized") else "0"
+    decision_id = str(decision.get("decision_id") or "")
+    lease_id = str(decision.get("lease_id") or "")
+    if role == "router_monitor":
+        return (
+            f"SR_ON WAIT decision_id={decision_id} lease_id={lease_id} risk={decision['risk']}. "
+            "Use smart_router.wait_for_condition exactly once with these IDs; do not spawn an agent or poll. "
+            "The MCP call blocks deterministically until the condition, timeout, or cancellation, then this Sol turn resumes."
+        )
     return (
-        f"SR_ON DELEGATE role={role} profile={execution_profile} light={light_profile} write={write_flag}. "
-        "Call smart_router.route_task once with these exact role/profile/light_profile values, a bounded task, "
-        "and only required image paths; no subagents. "
-        "Integrate the receipt. If completed, append `路由：` plus exact receipt._router_meta.route_label. "
-        "If blocked/failed/error, continue in Sol and end with "
+        f"SR_ON DELEGATE decision_id={decision_id} lease_id={lease_id} role={role} profile={execution_profile} light={light_profile} write={write_flag}. "
+        "Call smart_router.route_task once with these exact values and a bounded task; no subagents. "
+        "Trust receipt coverage; check only parent_verification, anomalies, and a small sample. "
+        "On success append `路由：` + receipt._router_meta.route_label. On error continue in Sol and end with "
         'exactly: "路由回退：Sol（委派未完成）".'
     )

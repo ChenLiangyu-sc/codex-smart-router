@@ -27,7 +27,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Agent|spawn_agent|mcp__smart_router__route_task|smart_router__route_task",
+        "matcher": "Agent|spawn_agent|mcp__smart_router__route_task|smart_router__route_task|mcp__smart_router__wait_for_condition|smart_router__wait_for_condition",
         "hooks": [
           {
             "type": "command",
@@ -39,23 +39,11 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__smart_router__route_task|smart_router__route_task",
+        "matcher": "mcp__smart_router__route_task|smart_router__route_task|mcp__smart_router__wait_for_condition|smart_router__wait_for_condition",
         "hooks": [
           {
             "type": "command",
             "command": "router_base=\"${CODEX_HOME:-$HOME/.codex}/smart-router\"; router_link=\"$router_base/runtime-current\"; release_base=\"$router_base/runtime-releases\"; router_runtime=\"$router_link/hooks/router_hook.py\"; plugin_runtime=\"${PLUGIN_ROOT:-}/hooks/router_hook.py\"; router_target=$(readlink \"$router_link\" 2>/dev/null || true); router_suffix=${router_target#runtime-releases/}; release_root=\"$router_base/$router_target\"; stable_ok=false; if [ \"$router_target\" = \"runtime-releases/$router_suffix\" ] && [ ${#router_suffix} -eq 20 ]; then case \"$router_suffix\" in *[!0-9a-f]*) ;; *) stable_ok=true ;; esac; fi; if [ \"$stable_ok\" = true ] && [ ! -L \"$router_base\" ] && [ ! -L \"$release_base\" ] && [ ! -L \"$release_root\" ] && [ -d \"$release_root\" ] && [ ! -L \"$release_root/hooks\" ] && [ -f \"$router_runtime\" ] && [ ! -L \"$router_runtime\" ]; then python3 \"$router_runtime\" post-tool-use || exit 0; elif [ -n \"${PLUGIN_ROOT:-}\" ] && [ -f \"$plugin_runtime\" ]; then python3 \"$plugin_runtime\" post-tool-use || exit 0; else exit 0; fi",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": "^router_",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "router_base=\"${CODEX_HOME:-$HOME/.codex}/smart-router\"; router_link=\"$router_base/runtime-current\"; release_base=\"$router_base/runtime-releases\"; router_runtime=\"$router_link/hooks/router_hook.py\"; plugin_runtime=\"${PLUGIN_ROOT:-}/hooks/router_hook.py\"; router_target=$(readlink \"$router_link\" 2>/dev/null || true); router_suffix=${router_target#runtime-releases/}; release_root=\"$router_base/$router_target\"; stable_ok=false; if [ \"$router_target\" = \"runtime-releases/$router_suffix\" ] && [ ${#router_suffix} -eq 20 ]; then case \"$router_suffix\" in *[!0-9a-f]*) ;; *) stable_ok=true ;; esac; fi; if [ \"$stable_ok\" = true ] && [ ! -L \"$router_base\" ] && [ ! -L \"$release_base\" ] && [ ! -L \"$release_root\" ] && [ -d \"$release_root\" ] && [ ! -L \"$release_root/hooks\" ] && [ -f \"$router_runtime\" ] && [ ! -L \"$router_runtime\" ]; then python3 \"$router_runtime\" subagent-stop || exit 0; elif [ -n \"${PLUGIN_ROOT:-}\" ] && [ -f \"$plugin_runtime\" ]; then python3 \"$plugin_runtime\" subagent-stop || exit 0; else exit 0; fi",
             "timeout": 5
           }
         ]

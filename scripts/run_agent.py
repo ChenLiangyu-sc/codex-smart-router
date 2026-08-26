@@ -7,10 +7,12 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -67,10 +69,19 @@ NON_TOOL_ITEM_TYPES = {"agent_message", "reasoning", "error", "todo_list"}
 
 
 class ChildFailure(RuntimeError):
-    def __init__(self, detail: str, *, may_have_mutated: bool = False) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        may_have_mutated: bool = False,
+        usage: dict[str, int] | None = None,
+        duration_ms: int = 0,
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.may_have_mutated = may_have_mutated
+        self.usage = usage or {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        self.duration_ms = max(0, duration_ms)
 
 
 def role_instructions(role: str) -> str:
@@ -255,6 +266,66 @@ def _stream_may_have_mutated(stdout: str) -> bool:
     return _stream_evidence(stdout)[1]
 
 
+def _stream_usage(stdout: str) -> dict[str, int]:
+    """Collect Codex JSONL usage without retaining child reasoning or messages."""
+    totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = event.get("usage") if isinstance(event, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        for name in totals:
+            value = usage.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                totals[name] += value
+    return totals
+
+
+def _normalize_receipt_text(raw: str) -> tuple[str, list[str]]:
+    """Normalize only bounded flat object items emitted by non-strict providers."""
+    try:
+        receipt = json.loads(
+            raw,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid constant: {value}")),
+        )
+    except (json.JSONDecodeError, ValueError):
+        return raw, []
+    if not isinstance(receipt, dict):
+        return raw, []
+    normalized_fields: list[str] = []
+    limits = {"findings": 800, "evidence": 800}
+    for field, limit in limits.items():
+        items = receipt.get(field)
+        if not isinstance(items, list) or not any(isinstance(item, dict) for item in items):
+            continue
+        converted: list[str] = []
+        for item in items:
+            if isinstance(item, str):
+                converted.append(item)
+                continue
+            if not isinstance(item, dict) or len(item) > 8:
+                return raw, []
+            if not all(
+                isinstance(key, str)
+                and isinstance(value, (str, int, float, bool, type(None)))
+                and not (isinstance(value, float) and not math.isfinite(value))
+                for key, value in item.items()
+            ):
+                return raw, []
+            text = "; ".join(f"{key}={value}" for key, value in item.items())
+            if not text or len(text) >= limit:
+                return raw, []
+            converted.append(text)
+        receipt[field] = converted
+        normalized_fields.append(field)
+    if not normalized_fields:
+        return raw, []
+    return json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), allow_nan=False), normalized_fields
+
+
 def _writer_failure_may_have_mutated(
     role: str,
     before: str | None,
@@ -304,14 +375,18 @@ def _invoke(
     images: list[Path],
     env_source: Mapping[str, str] | None,
     home: str | Path | None,
-) -> tuple[str, str | None]:
+    objective_id: str,
+) -> tuple[str, str | None, dict[str, int], int]:
     prompt = (
         "You are a bounded Smart Router child process. Follow these role instructions exactly:\n\n"
         + role_instructions(role)
         + "\n\nAssigned task:\n"
         + task
+        + f"\n\nReceipt objective_id (copy exactly): {objective_id}"
         + "\n\nDo not spawn subagents. Return only the required receipt JSON. Keep summary within two sentences; "
-        "include only decision-relevant evidence and no process narration. Use at most six findings and six evidence "
+        "set schema_version to 2; include only decision-relevant evidence and no process narration. Record coverage, "
+        "inconsistencies, a compact evidence_manifest, and at most three parent_verification checks so the parent can "
+        "verify hashes/anomalies/samples without rereading all inputs. Use at most six findings and six evidence "
         "items, at most eight changed_files, and at most six validation/remaining_risks items. Keep each "
         "findings/evidence item under 700 "
         "characters, validation/remaining_risks item under 500, and changed_files path under 250. End every item "
@@ -322,6 +397,7 @@ def _invoke(
     with tempfile.TemporaryDirectory(prefix="codex-smart-router-") as tmp:
         output = Path(tmp) / "receipt.json"
         command = build_command(role, output, executor, images, home)
+        started = time.monotonic()
         try:
             result = subprocess.run(
                 command,
@@ -335,21 +411,39 @@ def _invoke(
             )
         except subprocess.TimeoutExpired as exc:
             detail = redact_secrets(f"Codex child timed out after {timeout}s", [key])
-            raise ChildFailure(detail, may_have_mutated=role in WRITER_ROLES) from exc
+            partial = exc.stdout if exc.stdout is not None else exc.output
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            partial_text = partial if isinstance(partial, str) else ""
+            raise ChildFailure(
+                detail,
+                may_have_mutated=role in WRITER_ROLES,
+                usage=_stream_usage(partial_text),
+                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            ) from exc
         if result.returncode != 0:
             after = _git_fingerprint(target_workspace) if role in WRITER_ROLES else before
             detail = redact_secrets((result.stderr or result.stdout).strip()[-4000:], [key])
             raise ChildFailure(
                 f"Codex child failed with exit {result.returncode}: {detail}",
                 may_have_mutated=_writer_failure_may_have_mutated(role, before, after, result.stdout),
+                usage=_stream_usage(result.stdout),
+                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
             )
         try:
-            return output.read_text(encoding="utf-8"), key
+            return (
+                output.read_text(encoding="utf-8"),
+                key,
+                _stream_usage(result.stdout),
+                max(0, int((time.monotonic() - started) * 1000)),
+            )
         except FileNotFoundError as exc:
             after = _git_fingerprint(target_workspace) if role in WRITER_ROLES else before
             raise ChildFailure(
                 "Codex child returned no receipt file",
                 may_have_mutated=_writer_failure_may_have_mutated(role, before, after, result.stdout),
+                usage=_stream_usage(result.stdout),
+                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
             ) from exc
 
 
@@ -369,6 +463,7 @@ def run_task(
     now: dt.datetime | None = None,
     env: Mapping[str, str] | None = None,
     codex_home: str | Path | None = None,
+    objective_id: str | None = None,
 ) -> dict[str, Any]:
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
@@ -378,6 +473,9 @@ def run_task(
     normalized_light = light_profile.upper()
     if normalized_light not in LIGHT_PROFILES:
         raise ValueError(f"unsupported light profile: {light_profile}")
+    expected_objective_id = objective_id or hashlib.sha256(task.encode("utf-8", "replace")).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_objective_id):
+        raise ValueError("objective_id must be a lowercase SHA-256 hex digest")
     safety = classify(task)
     if safety["risk"] == "HIGH":
         raise ValueError("high-risk task must remain with the main Sol agent")
@@ -397,6 +495,9 @@ def run_task(
         home=codex_home,
     )
     attempts: list[str] = []
+    receipt_normalizations: list[str] = []
+    usage_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    duration_ms = 0
     fallback_reason = (
         resolution.reason
         if resolution.executor.provider != GLM_PROVIDER_ID and profile != PROFILE_STABLE and role not in {"router_scout", "router_monitor", "router_tester", "router_docs"}
@@ -410,17 +511,50 @@ def run_task(
         fallback_reason = resolution.reason
 
     def execute(executor: ExecutorSpec) -> tuple[str, str | None]:
+        nonlocal duration_ms
         attempts.append(executor.id)
-        return _invoke(role, task, executor, target_workspace, timeout, image_paths, env, codex_home)
+        try:
+            raw, key, usage, elapsed = _invoke(
+                role,
+                task,
+                executor,
+                target_workspace,
+                timeout,
+                image_paths,
+                env,
+                codex_home,
+                expected_objective_id,
+            )
+            raw, normalized = _normalize_receipt_text(raw)
+            receipt_normalizations.extend(
+                field for field in normalized if field not in receipt_normalizations
+            )
+        except ChildFailure as exc:
+            duration_ms += exc.duration_ms
+            for name in usage_total:
+                usage_total[name] += int(exc.usage.get(name, 0))
+            raise
+        duration_ms += elapsed
+        for name in usage_total:
+            usage_total[name] += int(usage.get(name, 0))
+        return raw, key
 
     def execute_with_fallback() -> tuple[str, ExecutorSpec, str | None]:
         executor = resolution.executor
         try:
             raw, _ = execute(executor)
-            if resolution.local_available:
-                valid_local, local_errors, _ = validate_receipt(raw)
-                if not valid_local:
-                    raise ChildFailure("local provider returned an invalid receipt: " + "; ".join(local_errors))
+            valid_attempt, attempt_errors, _ = validate_receipt(raw)
+            if not valid_attempt:
+                raise ChildFailure(
+                    f"{executor.provider} returned an invalid receipt: " + "; ".join(attempt_errors),
+                    may_have_mutated=role in WRITER_ROLES,
+                )
+            attempt_receipt = json.loads(raw)
+            if attempt_receipt.get("objective_id") != expected_objective_id:
+                raise ChildFailure(
+                    f"{executor.provider} returned a receipt for a different objective_id",
+                    may_have_mutated=role in WRITER_ROLES,
+                )
             if executor.provider == GLM_PROVIDER_ID:
                 record_glm_success(
                     codex_home,
@@ -471,6 +605,8 @@ def run_task(
     valid, errors, receipt = validate_receipt(raw)
     if not valid or receipt is None:
         raise RuntimeError("invalid child receipt: " + "; ".join(errors))
+    if receipt.get("objective_id") != expected_objective_id:
+        raise RuntimeError("invalid child receipt: objective_id does not match the routed decision")
     receipt["_router_meta"] = {
         "role": role,
         "model": executor.model,
@@ -483,6 +619,9 @@ def run_task(
         "selection_reason": resolution.reason,
         "fallback_reason": actual_fallback_reason,
         "attempted_executors": attempts,
+        "usage": usage_total,
+        "duration_ms": duration_ms,
+        "receipt_normalizations": receipt_normalizations,
     }
     return receipt
 

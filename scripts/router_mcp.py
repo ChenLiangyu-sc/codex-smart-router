@@ -7,6 +7,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,11 @@ from provider_policy import (
     PROFILE_STABLE,
 )
 from run_agent import ROLE_SETTINGS, run_task
+from router_core import consume_runtime_lease, data_root, delegation_task_digest
+
+_REPLY_LOCK = threading.Lock()
+_CANCEL_LOCK = threading.Lock()
+_CANCEL_EVENTS: dict[Any, threading.Event] = {}
 
 
 def routing_enabled() -> bool:
@@ -50,7 +57,8 @@ def plugin_version() -> str:
 def reply(request_id: Any, result: dict[str, Any] | None = None, error: dict[str, Any] | None = None) -> None:
     payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
     payload["error" if error is not None else "result"] = error if error is not None else (result or {})
-    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+    with _REPLY_LOCK:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 def tool_definition() -> dict[str, Any]:
@@ -60,16 +68,22 @@ def tool_definition() -> dict[str, Any]:
         "description": (
             "Run one low-risk task with the exact SR_ON role and execution profile. "
             "LUNA_STABLE handles light roles with Luna; LOCAL_TEXT_FIRST dynamically uses a configured text-only "
-            "provider for scout/monitor with Luna fallback. GLM_FIRST selects GLM-5.3 Max for eligible text work and "
+            "provider for scout with Luna fallback. GLM_FIRST selects GLM-5.3 Max for eligible text work and "
             "automatically uses Terra for peak windows, provider fallback, or attached images."
         ),
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["role", "task"],
+            "required": ["decision_id", "lease_id", "role", "task"],
             "properties": {
-                "role": {"type": "string", "enum": sorted(ROLE_SETTINGS)},
+                "decision_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "lease_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "role": {
+                    "type": "string",
+                    "enum": sorted(set(ROLE_SETTINGS) - {"router_monitor"}),
+                },
                 "task": {"type": "string", "minLength": 1, "maxLength": 20000},
+                "timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 3600, "default": 900},
                 "execution_profile": {
                     "type": "string",
                     "enum": sorted(EXECUTION_PROFILES),
@@ -91,7 +105,119 @@ def tool_definition() -> dict[str, Any]:
     }
 
 
-def handle(message: dict[str, Any]) -> None:
+def wait_tool_definition() -> dict[str, Any]:
+    return {
+        "name": "wait_for_condition",
+        "title": "Wait deterministically for one condition",
+        "description": (
+            "Block once without invoking a model or polling from the parent. Wait for a process to exit, a file to "
+            "appear/disappear, or exact text to appear in a file. Returns when satisfied, timed out, or cancelled."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision_id", "lease_id", "condition", "target"],
+            "properties": {
+                "decision_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "lease_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "condition": {
+                    "type": "string",
+                    "enum": ["process_exit", "file_exists", "file_absent", "file_contains"],
+                },
+                "target": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "PID for process_exit; otherwise a local file path.",
+                },
+                "expected": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 900},
+                "interval_seconds": {"type": "number", "minimum": 0.2, "maximum": 30, "default": 2},
+            },
+        },
+    }
+
+
+def _condition_observed(condition: str, target: str, expected: str | None) -> tuple[bool, str]:
+    if condition == "process_exit":
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", target):
+            raise ValueError("process_exit target must be a positive PID")
+        try:
+            os.kill(int(target), 0)
+        except ProcessLookupError:
+            return True, "process is no longer running"
+        except PermissionError:
+            return False, "process still exists (permission denied for signal probe)"
+        return False, "process is still running"
+    path = Path(target).expanduser()
+    if condition == "file_exists":
+        return path.exists(), "file exists" if path.exists() else "file does not exist"
+    if condition == "file_absent":
+        return not path.exists(), "file is absent" if not path.exists() else "file still exists"
+    if condition == "file_contains":
+        if not expected:
+            raise ValueError("file_contains requires expected text")
+        if not path.is_file():
+            return False, "file does not exist"
+        if path.stat().st_size > 32 * 1024 * 1024:
+            raise ValueError("file_contains refuses files larger than 32 MiB")
+        content = path.read_text(encoding="utf-8", errors="replace")
+        return expected in content, "expected text found" if expected in content else "expected text not found"
+    raise ValueError(f"unsupported condition: {condition}")
+
+
+def wait_for_condition(
+    args: dict[str, Any], cancel_event: threading.Event | None = None
+) -> dict[str, Any]:
+    condition = str(args.get("condition") or "")
+    target = str(args.get("target") or "")
+    expected = args.get("expected")
+    if expected is not None and not isinstance(expected, str):
+        raise ValueError("expected must be text")
+    timeout = int(args.get("timeout_seconds", 900))
+    interval = float(args.get("interval_seconds", 2))
+    if not 1 <= timeout <= 3600 or not 0.2 <= interval <= 30:
+        raise ValueError("wait timeout or interval is outside the supported range")
+    started = time.monotonic()
+    observed = "condition not checked"
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            status = "cancelled"
+            observed = "wait cancelled by the MCP client"
+            break
+        satisfied, observed = _condition_observed(condition, target, expected)
+        elapsed = time.monotonic() - started
+        if satisfied:
+            status = "completed"
+            break
+        if elapsed >= timeout:
+            status = "timeout"
+            break
+        delay = min(interval, max(0.0, timeout - elapsed))
+        if cancel_event is None:
+            time.sleep(delay)
+        elif cancel_event.wait(delay):
+            status = "cancelled"
+            observed = "wait cancelled by the MCP client"
+            break
+    total_elapsed = time.monotonic() - started
+    return {
+        "status": status,
+        "condition": condition,
+        "observed": observed,
+        "elapsed_seconds": round(total_elapsed, 3),
+        "_router_meta": {
+            "role": "router_monitor",
+            "model": None,
+            "provider": "deterministic",
+            "route_label": "确定性长等待（无模型轮询）",
+            "usage": {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0},
+            "duration_ms": max(0, int(total_elapsed * 1000)),
+        },
+    }
+
+
+def handle(message: dict[str, Any], cancel_event: threading.Event | None = None) -> None:
     method = message.get("method")
     request_id = message.get("id")
     if method == "initialize":
@@ -107,16 +233,40 @@ def handle(message: dict[str, Any]) -> None:
     elif method == "ping":
         reply(request_id, {})
     elif method == "tools/list":
-        reply(request_id, {"tools": [tool_definition()]})
+        reply(request_id, {"tools": [tool_definition(), wait_tool_definition()]})
     elif method == "tools/call":
         params = message.get("params") or {}
-        if params.get("name") != "route_task":
+        tool_name = params.get("name")
+        if tool_name not in {"route_task", "wait_for_condition"}:
             reply(request_id, error={"code": -32602, "message": "unknown tool"})
             return
         args = params.get("arguments") or {}
         try:
             if not routing_enabled():
                 raise PermissionError("Smart Router is globally disabled or locally parked")
+            decision_id = str(args.get("decision_id") or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", decision_id):
+                raise ValueError("decision_id must be a lowercase SHA-256 hex digest")
+            lease_id = str(args.get("lease_id") or "")
+            if not re.fullmatch(r"[0-9a-f]{32}", lease_id):
+                raise ValueError("lease_id must be a lowercase 128-bit hex nonce")
+            role = "router_monitor" if tool_name == "wait_for_condition" else str(args.get("role") or "")
+            task_digest = delegation_task_digest(tool_name, args)
+            if not consume_runtime_lease(data_root(), decision_id, lease_id, role, task_digest):
+                raise PermissionError("no matching unconsumed routing lease for this task")
+            if tool_name == "wait_for_condition":
+                result = wait_for_condition(args, cancel_event)
+                reply(
+                    request_id,
+                    {
+                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                        "structuredContent": result,
+                        "isError": result["status"] in {"failed", "timeout", "cancelled"},
+                    },
+                )
+                return
+            if str(args.get("role") or "") == "router_monitor":
+                raise ValueError("router_monitor must use wait_for_condition; model polling is disabled")
             profile = str(args.get("execution_profile") or PROFILE_STABLE).upper()
             light_profile = str(args.get("light_profile") or LIGHT_PROFILE_LUNA_STABLE).upper()
             images = args.get("images") or []
@@ -128,6 +278,8 @@ def handle(message: dict[str, Any]) -> None:
                 execution_profile=profile,
                 light_profile=light_profile,
                 images=images,
+                timeout=int(args.get("timeout_seconds", 900)),
+                objective_id=decision_id,
             )
             failed = receipt.get("status") in {"blocked", "failed"}
             reply(
@@ -149,13 +301,40 @@ def handle(message: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    threads: list[threading.Thread] = []
     for line in sys.stdin:
         try:
             value = json.loads(line)
             if isinstance(value, dict):
-                handle(value)
+                if value.get("method") == "notifications/cancelled":
+                    request_id = (value.get("params") or {}).get("requestId")
+                    with _CANCEL_LOCK:
+                        event = _CANCEL_EVENTS.get(request_id)
+                    if event is not None:
+                        event.set()
+                    continue
+                if value.get("method") == "tools/call" and value.get("id") is not None:
+                    request_id = value["id"]
+                    event = threading.Event()
+                    with _CANCEL_LOCK:
+                        _CANCEL_EVENTS[request_id] = event
+
+                    def run_tool(message: dict[str, Any] = value, request: Any = request_id, stop: threading.Event = event) -> None:
+                        try:
+                            handle(message, stop)
+                        finally:
+                            with _CANCEL_LOCK:
+                                _CANCEL_EVENTS.pop(request, None)
+
+                    thread = threading.Thread(target=run_tool, daemon=False)
+                    thread.start()
+                    threads.append(thread)
+                else:
+                    handle(value)
         except Exception as exc:
             print(f"smart-router MCP warning: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    for thread in threads:
+        thread.join()
     return 0
 
 

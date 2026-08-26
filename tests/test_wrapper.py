@@ -4,8 +4,10 @@ import json
 import io
 import subprocess
 import os
+import re
 import sys
 import tempfile
+import threading
 import unittest
 import datetime as dt
 from pathlib import Path
@@ -17,22 +19,34 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import run_agent
 import router_mcp
+import router_core
 import provider_policy
 import local_provider
 
 
-def valid_receipt():
-    return {
+def valid_receipt(prompt=None):
+    receipt = {
+        "schema_version": 2,
+        "objective_id": "0" * 64,
         "status": "completed",
         "summary": "done",
         "findings": [],
         "evidence": [],
+        "evidence_manifest": [],
+        "inconsistencies": [],
+        "coverage": {"mode": "targeted", "checked": 1, "total": 1},
+        "parent_verification": ["sample one result"],
         "changed_files": [],
         "validation": ["ok"],
         "remaining_risks": [],
         "needs_escalation": False,
         "recommended_next_action": "integrate",
     }
+    if isinstance(prompt, str):
+        match = re.search(r"Receipt objective_id \(copy exactly\): ([0-9a-f]{64})", prompt)
+        if match:
+            receipt["objective_id"] = match.group(1)
+    return receipt
 
 
 class WrapperTests(unittest.TestCase):
@@ -89,7 +103,7 @@ class WrapperTests(unittest.TestCase):
             if "--output-last-message" not in command:
                 return subprocess.CompletedProcess(command, 1, "", "")
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
@@ -115,7 +129,7 @@ class WrapperTests(unittest.TestCase):
     def test_valid_receipt_gets_executor_metadata(self):
         def fake_run(command, **kwargs):
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
@@ -124,15 +138,251 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
         self.assertEqual(receipt["_router_meta"]["provider"], "openai")
 
-    def test_mcp_tool_schema_has_all_roles(self):
+    def test_usage_and_duration_are_recorded_without_child_content(self):
+        def fake_run(command, **kwargs):
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
+            stdout = json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 120, "cached_input_tokens": 80, "output_tokens": 25},
+                }
+            )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            receipt = run_agent.run_task("router_scout", "搜索仓库中的测试文件")
+        self.assertEqual(
+            receipt["_router_meta"]["usage"],
+            {"input_tokens": 120, "cached_input_tokens": 80, "output_tokens": 25},
+        )
+        self.assertGreaterEqual(receipt["_router_meta"]["duration_ms"], 0)
+
+    def test_flat_provider_objects_are_normalized_without_another_model_call(self):
+        receipt = valid_receipt()
+        receipt["findings"] = [{"severity": "high", "finding": "bounded defect"}]
+        receipt["evidence"] = [{"path": "a.py", "line": 7}]
+        raw, fields = run_agent._normalize_receipt_text(json.dumps(receipt))
+        valid, errors, normalized = run_agent.validate_receipt(raw)
+        self.assertTrue(valid, errors)
+        self.assertEqual(fields, ["findings", "evidence"])
+        self.assertIn("severity=high", normalized["findings"][0])
+
+    def test_nested_provider_objects_remain_invalid(self):
+        receipt = valid_receipt()
+        receipt["findings"] = [{"finding": {"nested": "not accepted"}}]
+        raw, fields = run_agent._normalize_receipt_text(json.dumps(receipt))
+        valid, _, _ = run_agent.validate_receipt(raw)
+        self.assertFalse(valid)
+        self.assertEqual(fields, [])
+
+    def test_nonfinite_provider_values_are_not_normalized(self):
+        for value, marker in ((float("nan"), "NaN"), (float("inf"), "Infinity"), (-float("inf"), "-Infinity")):
+            with self.subTest(marker=marker):
+                receipt = valid_receipt()
+                receipt["findings"] = [{"score": value}]
+                raw, fields = run_agent._normalize_receipt_text(json.dumps(receipt))
+                self.assertEqual(fields, [])
+                self.assertIn(marker, raw)
+
+    def test_timeout_partial_usage_is_preserved(self):
+        partial = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 37, "cached_input_tokens": 11, "output_tokens": 5},
+            }
+        )
+        timeout = subprocess.TimeoutExpired(["codex"], 1, output=partial)
+        with mock.patch("run_agent.subprocess.run", side_effect=timeout):
+            with self.assertRaises(run_agent.ChildFailure) as raised:
+                run_agent.run_task("router_scout", "搜索仓库")
+        self.assertEqual(
+            raised.exception.usage,
+            {"input_tokens": 37, "cached_input_tokens": 11, "output_tokens": 5},
+        )
+
+    def test_explicit_objective_id_must_match_receipt(self):
+        def fake_run(command, **kwargs):
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("run_agent.subprocess.run", side_effect=fake_run):
+            with self.assertRaisesRegex(run_agent.ChildFailure, "different objective_id"):
+                run_agent.run_task("router_scout", "搜索仓库", objective_id="1" * 64)
+
+    def test_glm_objective_mismatch_falls_back_before_success_recording(self):
+        expected = "1" * 64
+
+        def fake_invoke(role, task, executor, workspace, timeout, images, env, home, objective_id):
+            receipt = valid_receipt()
+            if executor.provider != provider_policy.GLM_PROVIDER_ID:
+                receipt["objective_id"] = objective_id
+            return json.dumps(receipt), None, {
+                "input_tokens": 3,
+                "cached_input_tokens": 0,
+                "output_tokens": 1,
+            }, 5
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "run_agent._invoke", side_effect=fake_invoke
+        ), mock.patch("run_agent.record_glm_success") as success, mock.patch(
+            "run_agent.record_glm_failure"
+        ) as failure:
+            receipt = run_agent.run_task(
+                "router_reviewer",
+                "审查当前仓库多个模块",
+                execution_profile="GLM_FIRST",
+                now=dt.datetime(2026, 8, 24, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                env={provider_policy.GLM_ENV_KEY: "test-key"},
+                codex_home=tmp,
+                objective_id=expected,
+            )
+        success.assert_not_called()
+        failure.assert_called_once()
+        self.assertEqual(receipt["_router_meta"]["executor"], "terra_reviewer")
+        self.assertEqual(receipt["_router_meta"]["usage"]["input_tokens"], 6)
+
+    def test_local_objective_mismatch_falls_back_before_success_recording(self):
+        expected = "2" * 64
+
+        def fake_invoke(role, task, executor, workspace, timeout, images, env, home, objective_id):
+            receipt = valid_receipt()
+            if executor.provider == "openai":
+                receipt["objective_id"] = objective_id
+            return json.dumps(receipt), None, {
+                "input_tokens": 2,
+                "cached_input_tokens": 0,
+                "output_tokens": 1,
+            }, 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.local_config(tmp)
+            with mock.patch("run_agent._invoke", side_effect=fake_invoke), mock.patch(
+                "run_agent.record_local_success"
+            ) as success, mock.patch("run_agent.record_local_failure") as failure:
+                receipt = run_agent.run_task(
+                    "router_scout",
+                    "搜索当前仓库所有文件",
+                    light_profile="LOCAL_TEXT_FIRST",
+                    env={"LOCAL_MODEL_API_KEY": "test-local-key"},
+                    codex_home=tmp,
+                    objective_id=expected,
+                )
+        success.assert_not_called()
+        failure.assert_called_once()
+        self.assertEqual(receipt["_router_meta"]["executor"], "luna_scout")
+        self.assertEqual(receipt["_router_meta"]["usage"]["input_tokens"], 4)
+
+    def test_mcp_tool_schema_excludes_model_monitor(self):
         tool = router_mcp.tool_definition()
         self.assertEqual(tool["name"], "route_task")
         roles = tool["inputSchema"]["properties"]["role"]["enum"]
-        self.assertEqual(set(roles), set(run_agent.ROLE_SETTINGS))
+        self.assertEqual(set(roles), set(run_agent.ROLE_SETTINGS) - {"router_monitor"})
+        self.assertEqual(router_mcp.wait_tool_definition()["name"], "wait_for_condition")
         profiles = tool["inputSchema"]["properties"]["execution_profile"]["enum"]
         self.assertEqual(set(profiles), provider_policy.EXECUTION_PROFILES)
         light_profiles = tool["inputSchema"]["properties"]["light_profile"]["enum"]
         self.assertEqual(set(light_profiles), provider_policy.LIGHT_PROFILES)
+
+    def test_deterministic_wait_completes_without_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "ready.log"
+            marker.write_text("boot\nREADY\n", encoding="utf-8")
+            result = router_mcp.wait_for_condition(
+                {
+                    "condition": "file_contains",
+                    "target": str(marker),
+                    "expected": "READY",
+                    "timeout_seconds": 2,
+                    "interval_seconds": 0.2,
+                }
+            )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["_router_meta"]["provider"], "deterministic")
+        self.assertEqual(result["_router_meta"]["usage"]["input_tokens"], 0)
+        self.assertGreaterEqual(result["_router_meta"]["duration_ms"], 0)
+
+    def test_deterministic_wait_honors_cancellation(self):
+        cancel = threading.Event()
+        cancel.set()
+        result = router_mcp.wait_for_condition(
+            {
+                "condition": "process_exit",
+                "target": str(os.getpid()),
+                "timeout_seconds": 60,
+                "interval_seconds": 30,
+            },
+            cancel,
+        )
+        self.assertEqual(result["status"], "cancelled")
+        self.assertLess(result["elapsed_seconds"], 1)
+
+    def test_mcp_main_processes_cancel_notification_during_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            home = base / "home"
+            data = base / "data"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                '[plugins."codex-smart-router@personal"]\nenabled = true\n', encoding="utf-8"
+            )
+            args = {
+                "decision_id": "3" * 64,
+                "lease_id": "4" * 32,
+                "condition": "file_exists",
+                "target": str(base / "never-created"),
+                "timeout_seconds": 60,
+                "interval_seconds": 30,
+            }
+            state = router_core.default_state("cancel-session")
+            state["mode"] = "ON"
+            state["last_decision"] = {
+                "decision": "DELEGATE",
+                "decision_id": args["decision_id"],
+                "lease_id": args["lease_id"],
+                "role": "router_monitor",
+            }
+            state["current_delegation"] = {
+                "decision_id": args["decision_id"],
+                "lease_id": args["lease_id"],
+                "role": "router_monitor",
+                "task_digest": router_core.delegation_task_digest("wait_for_condition", args),
+                "status": "started",
+            }
+            router_core.save_state(data, "cancel-session", state)
+            call = {"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": "wait_for_condition", "arguments": args}}
+            cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 91, "reason": "test"}}
+            environment = os.environ.copy()
+            environment.update({"CODEX_HOME": str(home), "PLUGIN_DATA": str(data)})
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "router_mcp.py")],
+                input=json.dumps(call) + "\n" + json.dumps(cancel) + "\n",
+                text=True,
+                capture_output=True,
+                timeout=5,
+                env=environment,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout.strip())
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(response["result"]["structuredContent"]["status"], "cancelled")
+
+    def test_deterministic_wait_has_one_bounded_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "router_mcp.time.monotonic", side_effect=[0.0, 0.0, 1.1, 1.1]
+        ), mock.patch("router_mcp.time.sleep") as sleep:
+            result = router_mcp.wait_for_condition(
+                {
+                    "condition": "file_exists",
+                    "target": str(Path(tmp) / "never-created"),
+                    "timeout_seconds": 1,
+                    "interval_seconds": 0.2,
+                }
+            )
+        self.assertEqual(result["status"], "timeout")
+        sleep.assert_called_once()
 
     def test_glm_first_uses_glm_max_outside_peak(self):
         calls = []
@@ -142,7 +392,7 @@ class WrapperTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 1, "", "")
             calls.append(command)
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
@@ -183,7 +433,7 @@ class WrapperTests(unittest.TestCase):
         def fake_run(command, **kwargs):
             calls.append((command, kwargs["env"]))
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,7 +465,7 @@ class WrapperTests(unittest.TestCase):
             if "deepseek-v4-flash" in command:
                 return subprocess.CompletedProcess(command, 1, "", "connection refused")
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,7 +493,7 @@ class WrapperTests(unittest.TestCase):
         def fake_run(command, **kwargs):
             calls.append(command)
             output = Path(command[command.index("--output-last-message") + 1])
-            receipt = valid_receipt()
+            receipt = valid_receipt(kwargs.get("input"))
             if "deepseek-v4-flash" in command:
                 receipt["evidence"] = [f"item-{index}" for index in range(7)]
             output.write_text(json.dumps(receipt), encoding="utf-8")
@@ -313,7 +563,7 @@ class WrapperTests(unittest.TestCase):
             if "glm-5.3" in command:
                 return subprocess.CompletedProcess(command, 1, "", '{"code":1317,"next_flush_time":1800000000}')
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
@@ -403,7 +653,7 @@ class WrapperTests(unittest.TestCase):
                 stdout = json.dumps({"type": "turn.failed", "error": {"message": "quota"}})
                 return subprocess.CompletedProcess(command, 1, stdout, '{"code":1317}')
             output = Path(command[command.index("--output-last-message") + 1])
-            output.write_text(json.dumps(valid_receipt()), encoding="utf-8")
+            output.write_text(json.dumps(valid_receipt(kwargs.get("input"))), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("run_agent.subprocess.run", side_effect=fake_run):
@@ -428,16 +678,56 @@ class WrapperTests(unittest.TestCase):
             "jsonrpc": "2.0",
             "id": 7,
             "method": "tools/call",
-            "params": {"name": "route_task", "arguments": {"role": "router_scout", "task": "搜索文件"}},
+            "params": {
+                "name": "route_task",
+                "arguments": {
+                    "decision_id": "0" * 64,
+                    "lease_id": "0" * 32,
+                    "role": "router_scout",
+                    "task": "搜索文件",
+                },
+            },
         }
         stream = io.StringIO()
         with mock.patch("router_mcp.routing_enabled", return_value=True), mock.patch(
+            "router_mcp.consume_runtime_lease", return_value=True
+        ), mock.patch(
             "router_mcp.run_task", return_value=blocked
         ), redirect_stdout(stream):
             router_mcp.handle(request)
         response = json.loads(stream.getvalue())
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(response["result"]["structuredContent"]["status"], "blocked")
+
+    def test_mcp_wait_timeout_is_an_error_result(self):
+        request = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "wait_for_condition",
+                "arguments": {
+                    "decision_id": "0" * 64,
+                    "lease_id": "0" * 32,
+                    "condition": "file_exists",
+                    "target": "/tmp/never",
+                },
+            },
+        }
+        result = {
+            "status": "timeout",
+            "condition": "file_exists",
+            "observed": "file does not exist",
+            "elapsed_seconds": 1.0,
+            "_router_meta": {"role": "router_monitor", "duration_ms": 1000, "usage": {}},
+        }
+        stream = io.StringIO()
+        with mock.patch("router_mcp.routing_enabled", return_value=True), mock.patch(
+            "router_mcp.consume_runtime_lease", return_value=True
+        ), mock.patch("router_mcp.wait_for_condition", return_value=result), redirect_stdout(stream):
+            router_mcp.handle(request)
+        response = json.loads(stream.getvalue())
+        self.assertTrue(response["result"]["isError"])
 
     def test_mcp_respects_global_plugin_and_park_switches(self):
         with tempfile.TemporaryDirectory() as tmp:

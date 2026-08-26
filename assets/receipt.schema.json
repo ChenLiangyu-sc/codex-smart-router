@@ -3,10 +3,16 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "schema_version",
+    "objective_id",
     "status",
     "summary",
     "findings",
     "evidence",
+    "evidence_manifest",
+    "inconsistencies",
+    "coverage",
+    "parent_verification",
     "changed_files",
     "validation",
     "remaining_risks",
@@ -14,13 +20,39 @@
     "recommended_next_action"
   ],
   "properties": {
-    "status": {
-      "type": "string",
-      "enum": ["completed", "blocked", "failed"]
-    },
+    "schema_version": {"type": "integer", "const": 2},
+    "objective_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status": {"type": "string", "enum": ["completed", "blocked", "failed"]},
     "summary": {"type": "string", "maxLength": 500},
     "findings": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 800}},
     "evidence": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 800}},
+    "evidence_manifest": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "path", "locator", "sha256"],
+        "properties": {
+          "claim": {"type": "string", "maxLength": 500},
+          "path": {"type": "string", "maxLength": 300},
+          "locator": {"type": "string", "maxLength": 120},
+          "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "inconsistencies": {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 600}},
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "checked", "total"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["full", "sample", "targeted"]},
+        "checked": {"type": "integer", "minimum": 0},
+        "total": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "parent_verification": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 300}},
     "changed_files": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 300}},
     "validation": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 600}},
     "remaining_risks": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 600}},

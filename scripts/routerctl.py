@@ -43,7 +43,7 @@ def main() -> int:
     if args.command == "route":
         if not args.prompt:
             parser.error("route requires --prompt")
-        print(json.dumps(classify(args.prompt), ensure_ascii=False, indent=2))
+        print(json.dumps(classify(args.prompt, economics=True), ensure_ascii=False, indent=2))
         return 0
     print(json.dumps(load_state(root, args.session_id), ensure_ascii=False, indent=2))
     return 0
